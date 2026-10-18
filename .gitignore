@@ -1,0 +1,7 @@
+# 构建产物
+/build/
+*.o
+*.exe
+
+# 运行时自动存档
+club_data.txt
