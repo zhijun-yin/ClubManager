@@ -25,7 +25,7 @@ public:
     // 返回按 score 从高到低排序的前 k 个 (score, id)。O(k + log n)
     std::vector<std::pair<int, int>> topK(size_t k) const;
 
-    // 返回 (score, id) 的排名：有多少成员严格排在它前面（score 更高，或同分 id 更小）。O(log n)
+    // 返回从 0 开始的排名：score 更高，或同分 id 更大者在前，与 Top-K 保持一致。O(log n)
     int rankOf(int score, int id) const;
 
     // 统计 score 在 [lo, hi] 区间内的成员数量。O(log n)

@@ -1,11 +1,12 @@
 // web_server.cpp
 // 局域网多人共用 Web 界面：把 ClubSystem 暴露为本地 HTTP 服务器（REST API），
 // 浏览器打开即图形界面。跨平台：Windows 用 Winsock，Linux 用 POSIX sockets（#ifdef 切换）。
-// 简单身份选择：每个用户在顶栏选自己的成员身份，操作归属到该成员；不做密码/权限。
+// Cookie 会话认证；管理员与普通成员权限在服务端分别处理。
 // 无四语切换（按需求聚焦"多人共用"）。
 
 #include "web_server.h"
 #include "system.h"
+#include "auth.h"
 
 #include <string>
 #include <vector>
@@ -21,6 +22,8 @@
 #include <cstring>
 #include <cstdlib>
 #include <cstdio>
+#include <stdexcept>
+#include <csignal>
 
 #ifdef _WIN32
   #include <winsock2.h>
@@ -42,12 +45,18 @@
 #endif
 
 static std::mutex g_mutex;                 // 保护 sys，串行化并发请求
-static const int PORT = 8090;
+static int serverPort() {
+    const char* env = std::getenv("CLUB_PORT");
+    if (!env) return 8090;
+    size_t used = 0; int port = std::stoi(env, &used);
+    if (used != std::strlen(env) || port < 1 || port > 65535) throw std::invalid_argument("invalid CLUB_PORT");
+    return port;
+}
 static const char* SAVE_FILE = "club_data.txt";
 
 // ---------------------------------------------------------------------------
 // 嵌入的前端单页（中文 UI，无四语切换）。原生 JS，无外部依赖。
-// 顶栏“我的身份”下拉 = 简单身份选择：选自己的成员编号，操作归属到该成员。
+// 管理员可以选择代操作成员；普通成员身份固定为账号绑定的成员。
 // ---------------------------------------------------------------------------
 static const std::string kHtml = R"CLUBGUI(<!DOCTYPE html>
 <html lang="zh">
@@ -91,42 +100,102 @@ button.sm{padding:4px 8px;font-size:13px}
 #toast.show{opacity:1}#toast.ok{background:#16a34a}#toast.err{background:#dc2626}
 .muted{color:#94a3b8;font-size:13px}
 pre{white-space:pre-wrap}
+main{min-width:0;overflow-x:auto;max-width:1500px}nav{flex-shrink:0}
+button:disabled{opacity:.4;cursor:not-allowed!important}button:focus-visible,a:focus-visible,summary:focus-visible{outline:3px solid #60a5fa;outline-offset:3px}
+.download{display:inline-block;color:#1d4ed8;padding:6px;text-decoration:none;font-size:14px}
+.metrics{display:grid;grid-template-columns:repeat(auto-fit,minmax(155px,1fr));gap:14px;margin-bottom:20px}
+.metric{padding:22px;background:#fff;border:1px solid #e2e8f0;border-radius:12px}.metric strong{display:block;font-size:32px;color:#1e3a8a;margin-top:8px}.metric span{color:#64748b;font-size:14px}
+.hero{padding:24px;border-radius:12px;background:#e8efff;margin-bottom:20px}.hero p{color:#475569;margin-bottom:0;line-height:1.8}
+.two-col{display:grid;grid-template-columns:1fr 1fr;gap:16px}.empty{padding:24px;color:#64748b;text-align:center}
+progress{width:100%;height:12px;accent-color:#2563eb}summary{cursor:pointer;font-weight:600}dialog{border:0;border-radius:14px;padding:28px;max-width:600px;width:90%;box-shadow:0 20px 80px #0004}dialog::backdrop{background:#0f172a77}td{overflow-wrap:anywhere}h2{font-size:23px}
+[hidden]{display:none!important}.login{max-width:450px;margin:8vh auto;padding:30px}.login label{display:block;margin:18px 0 7px}.login input{width:100%}.login .btn{width:100%;margin-top:22px;padding:12px}.login p{line-height:1.8;color:#64748b}.account-actions{display:flex;gap:8px;flex-wrap:wrap;margin-top:16px}label.field{display:flex;flex-direction:column;gap:6px;color:#475569;font-size:13px}.session-tools{display:flex;align-items:center;gap:8px;flex-wrap:wrap}.session-user{font-size:13px;color:#dbeafe}
+@media(max-width:760px){.layout{display:block}nav{display:flex;overflow-x:auto;width:100%;padding:4px;border-right:0}nav button{width:auto;white-space:nowrap;padding:12px}main{padding:16px}.two-col{grid-template-columns:1fr}header{gap:8px}table{min-width:640px}.hero{padding:18px}}
 </style>
 </head>
 <body>
 <header>
   <span class="brand">🎭 社团管理系统</span>
-  <span class="lab">多人共用 · 局域网</span>
+  <span class="lab">社团日常 · 有序协作</span>
   <span class="grow"></span>
-  <span class="lab">我的身份：</span>
+  <div id="session_tools" class="session-tools" hidden><span id="session_user" class="session-user"></span>
+  <span id="identity_label" class="lab">代操作成员：</span>
   <select id="me"></select>
   <button id="undo">撤销</button>
   <button id="redo">重做</button>
-  <button id="save">保存</button>
+  <button id="refresh">刷新数据</button><button id="save">保存</button>
+  <button id="password">修改密码</button><button id="logout">退出登录</button></div>
 </header>
 <div class="layout">
-  <nav id="nav"></nav>
+  <nav id="nav" hidden></nav>
   <main id="main"></main>
 </div>
 <div id="toast"></div>
 <script>
 const $=s=>document.querySelector(s), main=$('#main'), nav=$('#nav'), meSel=$('#me');
-let ME=parseInt(localStorage.getItem('meId')||'0')||0, members=[], cur='members';
-const TABS=[{k:'members',n:'成员'},{k:'clubs',n:'社团'},{k:'activities',n:'活动'},{k:'apps',n:'审批'},{k:'friends',n:'好友'},{k:'rank',n:'排行'},{k:'announce',n:'公告'}];
+let ME=0, members=[], cur='dashboard', renderVersion=0, USER=null, CSRF='';
+const TABS=[{k:'dashboard',n:'总览'},{k:'schedule',n:'我的日程'},{k:'members',n:'成员'},{k:'clubs',n:'社团'},{k:'activities',n:'活动'},{k:'apps',n:'审批'},{k:'friends',n:'好友'},{k:'rank',n:'排行'},{k:'announce',n:'公告'},{k:'accounts',n:'账号权限'}];
 const esc=s=>String(s==null?'':s).replace(/[&<>"']/g,c=>({'&':'&amp;','<':'&lt;','>':'&gt;','"':'&quot;',"'":'&#39;'}[c]));
-async function api(method,path,body){const o={method,headers:{}};if(body!=null){o.headers['Content-Type']='application/x-www-form-urlencoded';o.body=toForm(body);}return (await fetch(path,o)).json();}
+async function api(method,path,body){
+  const o={method,headers:{},credentials:'same-origin'};
+  if(method!=='GET'&&CSRF)o.headers['X-CSRF-Token']=CSRF;
+  if(body!=null){o.headers['Content-Type']='application/x-www-form-urlencoded';o.body=toForm(body);}
+  try {
+    const response=await fetch(path,o), r=await response.json();
+    if(response.status===401&&path!=='/api/auth/login'){showLogin(true);toast('登录已失效，请重新登录',false);throw new Error('session-expired');}
+    if(!r.ok) toast(r.error||'请求失败',false);
+    return {...(r.data||{}),...r};
+  } catch(error) {if(error.message!=='session-expired')toast('连接失败，请检查服务器是否仍在运行',false);throw error;}
+}
 function toForm(o){return Object.keys(o).filter(k=>o[k]!=null&&o[k]!=='').map(k=>encodeURIComponent(k)+'='+encodeURIComponent(o[k])).join('&');}
 function toast(msg,ok=true){const t=$('#toast');t.textContent=msg;t.className='show '+(ok?'ok':'err');clearTimeout(t._h);t._h=setTimeout(()=>t.className='',2200);}
-function buildPicker(){const act=members.filter(x=>x.active);meSel.innerHTML=act.map(m=>`<option value="${m.id}">${esc(m.name)} (#${m.id})</option>`).join('');if(!act.some(m=>m.id===ME))ME=act.length?act[0].id:0;meSel.value=ME;meSel.onchange=()=>{ME=parseInt(meSel.value);localStorage.setItem('meId',ME);};}
+function buildPicker(){const act=members.filter(x=>x.active);meSel.innerHTML=act.map(m=>`<option value="${m.id}">${esc(m.name)} (#${m.id})</option>`).join('');if(USER?.role==='member')ME=USER.memberId;else if(!act.some(m=>m.id===ME))ME=act.length?act[0].id:0;meSel.value=ME;meSel.disabled=USER?.role!=='admin';meSel.onchange=()=>{if(USER?.role==='admin'){ME=parseInt(meSel.value);render();}};}
 async function refreshMe(){const d=await api('GET','/api/members');members=d.members||[];buildPicker();}
-function buildNav(){nav.innerHTML=TABS.map(t=>`<button data-tab="${t.k}">${t.n}</button>`).join('');nav.querySelectorAll('button').forEach(b=>b.onclick=()=>{cur=b.dataset.tab;render();});}
-function render(){nav.querySelectorAll('button').forEach(b=>b.classList.toggle('active',b.dataset.tab===cur));({members:renderMembers,clubs:renderClubs,activities:renderActivities,apps:renderApps,friends:renderFriends,rank:renderRank,announce:renderAnnounce}[cur])();}
+function buildNav(){const tabs=USER?.role==='admin'?TABS:[{k:'schedule',n:'我的日程'},{k:'activities',n:'活动报名'},{k:'clubs',n:'社团入社'},{k:'apps',n:'我的申请'},{k:'announce',n:'我的公告'}];nav.innerHTML=tabs.map(t=>`<button data-tab="${t.k}">${t.n}</button>`).join('');nav.querySelectorAll('button').forEach(b=>b.onclick=()=>{cur=b.dataset.tab;render();});}
+async function render(){if(!USER)return;const version=++renderVersion;await refreshMe();if(version!==renderVersion||!USER)return;nav.querySelectorAll('button').forEach(b=>b.classList.toggle('active',b.dataset.tab===cur));const views=USER.role==='admin'?{dashboard:renderDashboard,schedule:renderSchedule,members:renderMembers,clubs:renderClubs,activities:renderActivities,apps:renderApps,friends:renderFriends,rank:renderRank,announce:renderAnnounce,accounts:renderAccounts}:{schedule:renderSchedule,activities:renderMemberActivities,clubs:renderMemberClubs,apps:renderMemberApps,announce:renderMemberAnnouncements};(views[cur]||renderSchedule)().catch(()=>{});if(USER.role==='admin')updateHistory();}
+
+function showLogin(initialized){USER=null;CSRF='';members=[];ME=0;++renderVersion;document.querySelectorAll('dialog').forEach(d=>d.remove());$('#session_tools').hidden=true;nav.hidden=true;nav.innerHTML='';main.innerHTML=`<section class="card login"><span class="tag">CLUB MANAGER</span><h2 style="margin-top:18px">欢迎回到社团</h2><p>登录后管理你的活动与入社申请。</p>${initialized?'<form id="login_form"><label for="login_user">账号</label><input id="login_user" name="username" autocomplete="username" required maxlength="32" autofocus><label for="login_pass">密码</label><input id="login_pass" name="password" type="password" autocomplete="current-password" required maxlength="128"><button class="btn" type="submit">登录</button><p id="login_error" role="alert"></p></form><p class="muted">还没有账号？请联系社团管理员创建并绑定成员。忘记密码时请联系管理员重置。</p>':'<h3>首次使用</h3><p>请在服务器本机停止服务，运行以下命令设置管理员账号和密码，然后重新启动：</p><pre>club auth init admin</pre><p>系统没有默认账号或默认密码。</p>'}</section>`;if(initialized)$('#login_form').onsubmit=async e=>{e.preventDefault();const button=e.currentTarget.querySelector('button');button.disabled=true;try{const r=await api('POST','/api/auth/login',{username:$('#login_user').value,password:$('#login_pass').value});if(r.ok){$('#login_pass').value='';await enterSession(r);}else $('#login_error').textContent=r.error;}finally{button.disabled=false;}};}
+async function enterSession(r){USER=r.user;CSRF=r.csrf;ME=USER.memberId>=0?USER.memberId:0;cur=USER.role==='admin'?'dashboard':'schedule';$('#session_user').textContent=USER.username+' · '+(USER.role==='admin'?'管理员':'普通成员');$('#identity_label').textContent=USER.role==='admin'?'代操作成员：':'当前成员：';['undo','redo','save'].forEach(id=>$('#'+id).hidden=USER.role!=='admin');$('#session_tools').hidden=false;nav.hidden=false;buildNav();await render();}
+async function boot(){const r=await api('GET','/api/auth/status');if(r.authenticated)await enterSession(r);else showLogin(r.initialized);}
+function passwordDialog(username){const self=username==null, box=document.createElement('dialog');box.innerHTML=`<h2>${self?'修改我的密码':'重置 '+esc(username)+' 的密码'}</h2><p class="muted">密码需 10–128 字节。保存后该账号的旧会话立即失效。</p><form>${self?'<label class="field">当前密码<input name="currentPassword" type="password" autocomplete="current-password" required></label>':''}<label class="field">新密码<input name="password" type="password" autocomplete="new-password" minlength="10" maxlength="128" required></label><label class="field">确认新密码<input name="confirm" type="password" autocomplete="new-password" required></label><div class="account-actions"><button class="btn" type="submit">保存密码</button><button class="btn gray" type="button">取消</button></div><p role="alert"></p></form>`;document.body.append(box);box.querySelector('[type=button]').onclick=()=>box.close();box.onclose=()=>box.remove();box.querySelector('form').onsubmit=async e=>{e.preventDefault();const form=e.currentTarget,values=Object.fromEntries(new FormData(form));if(values.password!==values.confirm){box.querySelector('[role=alert]').textContent='两次密码不一致';return;}const button=form.querySelector('[type=submit]');button.disabled=true;try{const r=await api('POST',self?'/api/auth/password':`/api/accounts/${encodeURIComponent(username)}/password`,values);if(r.ok){box.close();toast('密码已更新，请使用新密码登录');if(self||username===USER?.username)showLogin(true);}else box.querySelector('[role=alert]').textContent=r.error;}finally{button.disabled=false;}};box.showModal();}
+
+async function renderMemberActivities(){const version=renderVersion,d=await api('GET','/api/activities');if(version!==renderVersion)return;main.innerHTML=`<h2>活动报名</h2><p class="muted">报名、候补与签到均归属当前登录成员。签到成功增加 10 积分。</p>${(d.activities||[]).map(a=>{const signed=a.signedUp.includes(ME),waiting=a.waitlist.includes(ME),checked=a.checkedIn.includes(ME);return `<section class="card"><h3>${esc(a.name)} <span class="tag">${a.closed?'已结束':checked?'已签到':signed?'已报名':waiting?'候补中':'可报名'}</span></h3><p>${activityTime(a)} · ${a.signedCount} / ${a.capacity} 人 · 候补 ${a.waitingCount} 人</p><p class="muted">所需标签：${a.requiredTags.map(esc).join('、')||'不限'}</p><div class="row"><button class="btn" ${a.closed||signed||waiting?'disabled':''} onclick="signup(${a.id})">报名</button><button class="btn gray" ${a.closed||checked||(!signed&&!waiting)?'disabled':''} onclick="cancelA(${a.id})">取消参与</button><button class="btn" ${a.closed||checked||!signed?'disabled':''} onclick="checkin(${a.id})">签到 +10</button></div></section>`;}).join('')||'<div class="card empty">暂无活动</div>'}`;}
+async function renderMemberClubs(){const version=renderVersion,[d,p]=await Promise.all([api('GET','/api/clubs'),api('GET','/api/applications')]);if(version!==renderVersion)return;main.innerHTML=`<h2>社团入社</h2><p class="muted">选择感兴趣的社团提交申请，由管理员审核。</p>${(d.clubs||[]).map(c=>{const joined=c.memberIds.includes(ME),pending=(p.applications||[]).some(a=>a.clubId===c.id&&a.status===0);return `<section class="card"><h3>${esc(c.name)} <span class="tag">${esc(c.category||'社团')}</span></h3><p>${esc(c.description||'欢迎加入我们')}</p><button class="btn" ${joined||pending?'disabled':''} onclick="applyClub(${c.id})">${joined?'已加入':pending?'申请待审核':'申请入社'}</button></section>`;}).join('')||'<div class="card empty">暂无社团</div>'}`;}
+async function applyClub(id){const r=await api('POST','/api/applications',{clubId:id});if(r.ok)toast('申请已提交，请等待审核');render();}
+async function renderMemberApps(){const version=renderVersion,[d,c]=await Promise.all([api('GET','/api/applications'),api('GET','/api/clubs')]);if(version!==renderVersion)return;const names=new Map((c.clubs||[]).map(v=>[v.id,v.name]));main.innerHTML=`<h2>我的入社申请</h2>${(d.applications||[]).slice().reverse().map(a=>`<section class="card"><h3>${esc(names.get(a.clubId)||'社团 #'+a.clubId)}</h3><p>申请 #${a.id} <span class="tag">${({0:'待审核',1:'已通过',[-1]:'已拒绝',[-2]:'已撤回'})[a.status]||'未知'}</span></p><button class="btn gray" ${a.status!==0?'disabled':''} onclick="withdraw(${a.id})">撤回申请</button></section>`).join('')||'<div class="card empty">还没有提交入社申请</div>'}`;}
+async function renderMemberAnnouncements(){const version=renderVersion,d=await api('GET','/api/announcements/member/'+ME);if(version!==renderVersion)return;main.innerHTML=`<h2>我的社团公告</h2>${(d.announcements||[]).map(a=>`<section class="card"><span class="muted">社团 #${a.clubId}</span><p style="white-space:pre-wrap">${esc(a.message)}</p></section>`).join('')||'<div class="card empty">暂无公告</div>'}`;}
+
+function memberOptions(id){return '<option value="-1">不绑定（仅管理员）</option>'+members.filter(m=>m.active).map(m=>`<option value="${m.id}" ${m.id===id?'selected':''}>${esc(m.name)} (#${m.id})</option>`).join('');}
+async function renderAccounts(){const version=renderVersion,d=await api('GET','/api/accounts');if(version!==renderVersion)return;main.innerHTML=`<h2>账号与权限</h2><p class="muted">普通成员必须绑定在册成员。修改权限、绑定或启用状态后，该账号需要重新登录。</p><section class="card"><h3>创建账号</h3><form id="account_create"><div class="row"><label class="field">账号<input name="username" autocomplete="off" pattern="[A-Za-z0-9_.-]{3,32}" placeholder="3–32 位英文或数字" required></label><label class="field">初始密码<input name="password" type="password" autocomplete="new-password" minlength="10" maxlength="128" required></label><label class="field">角色<select name="role"><option value="member">普通成员</option><option value="admin">管理员</option></select></label><label class="field">绑定成员<select name="memberId">${memberOptions(-1)}</select></label><button class="btn" type="submit">创建账号</button></div><p role="alert"></p></form></section><div class="two-col">${(d.accounts||[]).map(a=>`<section class="card"><h3>${esc(a.username)} <span class="tag">${a.role==='admin'?'管理员':'普通成员'}${!a.enabled?' · 已停用':''}</span></h3><form data-account="${esc(a.username)}"><div class="row"><label class="field">角色<select name="role"><option value="member" ${a.role==='member'?'selected':''}>普通成员</option><option value="admin" ${a.role==='admin'?'selected':''}>管理员</option></select></label><label class="field">绑定成员<select name="memberId">${memberOptions(a.memberId)}</select></label><label class="field">状态<select name="enabled"><option value="true" ${a.enabled?'selected':''}>启用</option><option value="false" ${!a.enabled?'selected':''}>停用</option></select></label></div>${a.memberId>=0&&!a.bindingValid?'<p style="color:#b91c1c">原绑定已失效，请核实成员后重新绑定。成员账号在此期间无法登录。</p>':''}<div class="account-actions"><button class="btn" type="submit">保存权限</button><button class="btn gray" type="button" data-reset="${esc(a.username)}">重置密码</button></div><p role="alert"></p></form></section>`).join('')}</div>`;
+  const create=$('#account_create');create.onsubmit=async e=>{e.preventDefault();const button=create.querySelector('button');button.disabled=true;try{const r=await api('POST','/api/accounts',Object.fromEntries(new FormData(create)));if(r.ok){create.reset();toast('账号已创建');render();}else create.querySelector('[role=alert]').textContent=r.error;}finally{button.disabled=false;}};
+  main.querySelectorAll('[data-account]').forEach(form=>form.onsubmit=async e=>{e.preventDefault();const username=form.dataset.account,r=await api('POST','/api/accounts/'+encodeURIComponent(username),Object.fromEntries(new FormData(form)));if(r.ok){toast('账号权限已保存');if(username===USER?.username)showLogin(true);else render();}else form.querySelector('[role=alert]').textContent=r.error;});main.querySelectorAll('[data-reset]').forEach(b=>b.onclick=()=>passwordDialog(b.dataset.reset));
+}
+
+function activityTime(a){const hm=m=>String(Math.floor(m/60)).padStart(2,'0')+':'+String(m%60).padStart(2,'0');return a.timed?'周'+['日','一','二','三','四','五','六'][a.day]+' '+hm(a.startMin)+'–'+hm(a.endMin):esc(a.time||'时间待定');}
+function filterTable(query,id){const q=query.trim().toLocaleLowerCase();document.querySelectorAll('#'+id+' tr').forEach(row=>row.hidden=!row.textContent.toLocaleLowerCase().includes(q));}
+async function updateHistory(){const r=await api('GET','/api/state');$('#undo').disabled=!r.canUndo;$('#redo').disabled=!r.canRedo;}
+async function importCsv(){const f=$('#csv_file').files[0];if(!f){toast('请先选择 CSV 文件',false);return;}if(f.size>200000){toast('文件请控制在 200 KB 内',false);return;}const r=await api('POST','/api/import/members',{csv:await f.text()});if(r.ok){$('#import_result').textContent=`新增 ${r.added} 人，重名跳过 ${r.skippedDup} 行，格式错误 ${r.skippedInvalid} 行。点击刷新数据查看名单。`;await refreshMe();updateHistory();}}
+async function renderDashboard(){const version=renderVersion;
+  const [r,d,b]=await Promise.all([api('GET','/api/stats'),api('GET','/api/activities'),api('GET','/api/rank/leaderboard?k=5')]);
+  const s=r.data||{},acts=(d.activities||[]).filter(a=>!a.closed);
+  if(version!==renderVersion)return;main.innerHTML=`<div class="hero"><span class="tag">CLUB MANAGER</span><h2 style="margin-top:12px">把社团日常，安排得井井有条</h2><p>管理成员、组织活动、审核申请，也记录每一次参与。选择上方身份，查看自己的日程与签到。</p></div>
+    <div class="metrics">${[['在册成员',s.members],['社团 / 部门',s.clubs],['开放活动',(s.activities||0)-(s.closedActivities||0)],['待审申请',s.pending],['正取 / 候补',`${s.registrations||0} / ${s.waiting||0}`],['累计签到',s.checkIns]].map(([label,value])=>`<div class="metric"><span>${label}</span><strong>${value??0}</strong></div>`).join('')}</div>
+    <div class="two-col"><section class="card"><h3>活动报名进度</h3>${acts.length?acts.slice(0,8).map(a=>`<p><strong>${esc(a.name)}</strong> <span class="muted">${a.signedUp.length} / ${a.capacity} 人 · 候补 ${a.waitlist.length}</span></p><progress max="${Math.max(1,a.capacity)}" value="${a.signedUp.length}" aria-label="${esc(a.name)}报名进度"></progress>`).join(''):'<p class="empty">还没有开放活动，去活动页面创建第一场。</p>'}</section>
+    <section class="card"><h3>活跃成员 Top 5</h3>${(b.board||[]).length?(b.board||[]).map((p,i)=>`<p><span class="tag">${i+1}</span> ${nameOf(p[1])}<strong style="float:right">${p[0]} 分</strong></p>`).join(''):'<p class="empty">从添加第一位成员开始。</p>'}<p class="muted">累计积分 ${s.totalScore||0} · 已结束活动 ${s.closedActivities||0}</p></section></div>`;
+}
+async function renderSchedule(){const version=renderVersion;
+  if(!members.some(m=>m.active)){if(version!==renderVersion)return;main.innerHTML='<h2>我的日程</h2><div class="card empty">请先添加成员，再选择你的身份。</div>';return;}
+  const d=await api('GET',`/api/schedule/${ME}`),list=d.activities||[];
+  if(version!==renderVersion)return;main.innerHTML=`<h2>${nameOf(ME)}的活动日程</h2><p class="muted">按星期和开始时间排序；待定时间及已结束活动排在后面。候补不占用正式日程，转正时重新检测冲突。</p>${list.length?list.map(a=>{const signed=a.signedUp.includes(ME),checked=a.checkedIn.includes(ME);return `<section class="card"><div class="row"><h3 style="margin:0">${esc(a.name)}</h3><span class="tag">${a.closed?'已结束':checked?'已签到':signed?'已报名':'候补中'}</span><span class="muted">${activityTime(a)}</span></div><div class="row" style="margin-top:14px"><button class="btn" ${!signed||checked||a.closed?'disabled':''} onclick="checkin(${a.id})">签到 +10</button><button class="btn gray" ${checked||a.closed?'disabled':''} onclick="cancelA(${a.id})">取消参与</button></div></section>`;}).join(''):'<div class="card empty">暂无参与的活动，去活动页面报名吧。</div>'}`;
+}
 
 /* ---- 成员 ---- */
-async function renderMembers(){
+async function renderMembers(){const version=renderVersion;
   const d=await api('GET','/api/members');members=d.members||[];buildPicker();
-  main.innerHTML=`
+  if(version!==renderVersion)return;main.innerHTML=`
   <h2>成员管理</h2>
+  <div class="card"><div class="row"><input id="member_search" aria-label="搜索成员" placeholder="搜索姓名、年级、标签" oninput="filterTable(this.value,'member_rows')">
+    <a class="download" href="/api/export/members" download="members.csv">导出成员 CSV</a></div></div>
+  <details class="card"><summary>批量导入成员</summary><p class="muted">UTF-8 CSV：姓名,年级,标签1;标签2。支持表头、逗号引号；逐行显示导入统计。</p><input type="file" id="csv_file" accept=".csv,.txt" aria-label="成员 CSV 文件"><button class="btn" onclick="importCsv()">导入</button><p id="import_result" role="status"></p></details>
   <div class="card"><h3>添加成员</h3><div class="row">
     <input id="m_name" placeholder="姓名"><input id="m_grade" placeholder="年级" style="width:90px">
     <input id="m_tags" placeholder="标签(逗号分隔) 如 Python,算法" style="width:240px">
@@ -137,8 +206,8 @@ async function renderMembers(){
     <select id="q_mode"><option value="all">同时具备(AND)</option><option value="any">任一具备(OR)</option></select>
     <button class="btn" onclick="queryTag('multi')">查询</button></div>
     <div id="qres" class="muted" style="margin-top:8px"></div></div>
-  <table><thead><tr><th>ID</th><th>姓名</th><th>年级</th><th>活跃度</th><th>标签</th><th>操作</th></tr></thead><tbody>
-  ${members.map(m=>`<tr style="${m.active?'':'opacity:.45'}"><td>${m.id}</td><td>${esc(m.name)}</td><td>${esc(m.grade)}</td><td>${m.score}</td>
+  <table><thead><tr><th>ID</th><th>姓名</th><th>年级</th><th>活跃度</th><th>标签</th><th>操作</th></tr></thead><tbody id="member_rows">
+  ${members.filter(m=>m.active).map(m=>`<tr style="${m.active?'':'opacity:.45'}"><td>${m.id}</td><td>${esc(m.name)}</td><td>${esc(m.grade)}</td><td>${m.score}</td>
     <td>${(m.tags||[]).map(t=>`<span class="tag">${esc(t)}</span>`).join('')}</td>
     <td><button class="btn sm" onclick="bump(${m.id},10)">+10</button>
         <button class="btn sm gray" onclick="bump(${m.id},-10)">-10</button>
@@ -156,10 +225,10 @@ function nameOf(id){const m=members.find(x=>x.id===id);return m?esc(m.name):('#'
 async function queryTag(mode){const res=$('#qres');if(mode==='one'){const tag=$('#q_tag').value.trim();if(!tag)return;const d=await api('GET','/api/members/bytag?tag='+encodeURIComponent(tag));res.innerHTML='具备「'+esc(tag)+'」的成员：'+((d.members||[]).map(nameOf).join('、')||'无');}else{const tags=$('#q_tags').value.trim();if(!tags)return;const m=$('#q_mode').value;const d=await api('GET','/api/members/bytags?mode='+m+'&tags='+encodeURIComponent(tags));res.innerHTML='结果：'+((d.members||[]).map(nameOf).join('、')||'无');}}
 
 /* ---- 社团 ---- */
-async function renderClubs(){
+async function renderClubs(){const version=renderVersion;
   const c=await api('GET','/api/clubs');buildPicker();
   const clubs=c.clubs||[];
-  main.innerHTML=`
+  if(version!==renderVersion)return;main.innerHTML=`
   <h2>社团与组织架构</h2>
   <div class="card"><h3>创建社团 / 子部门</h3><div class="row">
     <input id="c_name" placeholder="名称"><input id="c_cat" placeholder="分类" style="width:110px">
@@ -181,11 +250,11 @@ async function delClub(cid){if(!confirm('确认删除该社团?'))return;const r
 async function showOrg(){const d=await api('GET','/api/clubs/org');$('#org').textContent=(d.lines||[]).join('\n')||'（空）';}
 
 /* ---- 活动 ---- */
-async function renderActivities(){
+async function renderActivities(){const version=renderVersion;
   const a=await api('GET','/api/activities'),c=await api('GET','/api/clubs');buildPicker();
   const acts=a.activities||[];
-  main.innerHTML=`
-  <h2>活动管理</h2>
+  if(version!==renderVersion)return;main.innerHTML=`
+  <h2>活动管理</h2><div class="card row"><input aria-label="搜索活动" placeholder="搜索活动、社团或状态" oninput="filterTable(this.value,'activity_rows')"><span class="muted">签到奖励 10 分；已结束活动保留名单与签到记录。</span></div>
   <div class="card"><h3>创建活动</h3><div class="row">
     <input id="a_club" placeholder="社团ID" style="width:80px"><input id="a_name" placeholder="活动名称">
     <input id="a_time" placeholder="时间(展示用)" style="width:130px"><input id="a_cap" placeholder="容量" style="width:70px">
@@ -195,15 +264,22 @@ async function renderActivities(){
     <input id="t_cap" placeholder="容量" style="width:70px"><input id="t_day" placeholder="日0-6" style="width:70px">
     <input id="t_start" placeholder="起(分)" style="width:80px"><input id="t_end" placeholder="止(分)" style="width:80px">
     <input id="t_tags" placeholder="所需标签" style="width:140px"><button class="btn" onclick="addAct(true)">创建</button></div></div>
-  <table><thead><tr><th>ID</th><th>名称</th><th>社团</th><th>时间</th><th>容量</th><th>已报/候补</th><th>操作</th></tr></thead><tbody>
-  ${acts.map(a=>`<tr><td>${a.id}</td><td>${esc(a.name)}</td><td>${a.clubId}</td><td>${esc(a.time)}</td><td>${a.capacity}</td>
-    <td>${(a.signedUp||[]).length} / ${(a.waitlist||[]).length}</td>
-    <td><button class="btn sm" onclick="signup(${a.id})">报名</button>
+  <table><thead><tr><th>ID</th><th>名称</th><th>社团</th><th>时间</th><th>容量</th><th>正取 / 候补 / 签到</th><th>操作</th></tr></thead><tbody id="activity_rows">
+  ${acts.map(a=>`<tr><td>${a.id}</td><td>${esc(a.name)}</td><td>${esc((c.clubs||[]).find(x=>x.id===a.clubId)?.name||a.clubId)}</td><td>${activityTime(a)}<br><span class="tag">${a.closed?'已结束':'报名中'}</span></td><td>${a.capacity}</td>
+    <td>${(a.signedUp||[]).length} / ${(a.waitlist||[]).length} / ${(a.checkedIn||[]).length}</td>
+    <td><button class="btn sm" ${a.closed?'disabled':''} onclick="signup(${a.id})">报名</button>
+        <button class="btn sm" ${a.closed?'disabled':''} onclick="checkin(${a.id})">我的签到</button>
+        <button class="btn sm gray" onclick="showRoster(${a.id})">名单</button>
+        <a class="download" href="/api/activities/${a.id}/export" download="activity-${a.id}.csv">导出</a>
+        <button class="btn sm gray" ${a.closed?'disabled':''} onclick="closeAct(${a.id})">结束</button>
         <button class="btn sm gray" onclick="cancelA(${a.id})">取消</button>
         <button class="btn sm gray" onclick="setCap(${a.id})">改容量</button>
         <button class="btn sm danger" onclick="delAct(${a.id})">删除</button></td></tr>`).join('')}
   </tbody></table>`;
 }
+async function checkin(aid){const r=await api('POST',`/api/activities/${aid}/checkin`,{memberId:ME});toast(r.ok?'签到成功，活跃度 +10':r.error,r.ok);await refreshMe();render();}
+async function closeAct(aid){if(!confirm('结束活动后停止报名、取消和签到，历史名单仍保留。确认结束？'))return;const r=await api('POST',`/api/activities/${aid}/close`);toast(r.ok?'活动已结束':r.error,r.ok);render();}
+async function showRoster(aid){const d=await api('GET','/api/activities'),a=(d.activities||[]).find(x=>x.id===aid);if(!a)return;const w=await api('GET',`/api/activities/${aid}/waitlist`);const box=document.createElement('dialog');box.innerHTML=`<h2>${esc(a.name)} · 名单</h2><h3>正取</h3><p>${a.signedUp.map(id=>nameOf(id)+(a.checkedIn.includes(id)?' ✓ 已签到':'')).join('、')||'暂无'}</p><h3>候补（当前积分优先，同分 ID 小者优先）</h3><p>${(w.ids||[]).map(nameOf).join('、')||'暂无'}</p><button class="btn">关闭</button>`;document.body.append(box);box.querySelector('button').onclick=()=>box.close();box.onclose=()=>box.remove();box.showModal();}
 async function addAct(timed){let r;if(timed){r=await api('POST','/api/activities',{clubId:$('#t_club').value.trim(),name:$('#t_name').value.trim(),capacity:$('#t_cap').value.trim(),day:$('#t_day').value.trim(),startMin:$('#t_start').value.trim(),endMin:$('#t_end').value.trim(),requiredTags:$('#t_tags').value.trim()});}else{r=await api('POST','/api/activities',{clubId:$('#a_club').value.trim(),name:$('#a_name').value.trim(),time:$('#a_time').value.trim(),capacity:$('#a_cap').value.trim()});}toast(r.ok?('已创建 活动#'+r.data.id):(r.error||'失败'),r.ok);render();}
 async function signup(aid){const r=await api('POST',`/api/activities/${aid}/signup`,{memberId:ME});toast((r.data&&r.data.message)||(r.ok?'已报名':(r.error||'失败')),r.ok);render();}
 async function cancelA(aid){const r=await api('POST',`/api/activities/${aid}/cancel`,{memberId:ME});toast(r.ok?'已取消':(r.error||'失败'),r.ok);render();}
@@ -211,30 +287,31 @@ async function setCap(aid){const v=prompt('新容量:');if(v==null)return;const 
 async function delAct(aid){if(!confirm('确认删除该活动?'))return;const r=await api('DELETE',`/api/activities/${aid}`);toast(r.ok?'已删除':(r.error||'失败'),r.ok);render();}
 
 /* ---- 审批 ---- */
-async function renderApps(){
+async function renderApps(){const version=renderVersion;
   const a=await api('GET','/api/applications');buildPicker();
   const apps=a.applications||[],st={0:'待审',1:'通过',[-1]:'拒绝',[-2]:'撤回'};
-  main.innerHTML=`
+  if(version!==renderVersion)return;main.innerHTML=`
   <h2>入社审批（优先级队列）</h2>
   <div class="card"><h3>提交申请（以我的身份）</h3><div class="row">
     <input id="p_club" placeholder="社团ID" style="width:90px"><input id="p_prio" placeholder="优先级(0普通/1骨干/2加急)" style="width:220px">
     <button class="btn" onclick="submitApp()">提交</button>
-    <button class="btn gray" onclick="processApp()">处理队首(最高优先级)</button>
+    <button class="btn gray" onclick="processApp()">查看下一条待审</button>
     <span class="muted" id="pend"></span></div></div>
   <table><thead><tr><th>ID</th><th>成员</th><th>社团</th><th>优先级</th><th>状态</th><th>操作</th></tr></thead><tbody>
   ${apps.map(a=>`<tr><td>${a.id}</td><td>${nameOf(a.memberId)}</td><td>${a.clubId}</td><td>${a.priority}</td>
     <td>${st[a.status]||a.status}</td>
-    <td><button class="btn sm" onclick="review(${a.id},true)">通过</button>
-        <button class="btn sm danger" onclick="review(${a.id},false)">拒绝</button></td></tr>`).join('')}
+    <td><button class="btn sm" ${a.status!==0?'disabled':''} onclick="review(${a.id},true)">通过</button>
+        <button class="btn sm danger" ${a.status!==0?'disabled':''} onclick="review(${a.id},false)">拒绝</button> <button class="btn sm gray" ${a.status!==0||a.memberId!==ME?'disabled':''} onclick="withdraw(${a.id})">撤回</button></td></tr>`).join('')}
   </tbody></table>`;
-  const p=await api('GET','/api/applications/pending');$('#pend').textContent='待处理: '+(p.count||0);
+  const p=await api('GET','/api/applications/pending');if(version!==renderVersion)return;$('#pend').textContent='待处理: '+(p.count||0);
 }
 async function submitApp(){const r=await api('POST','/api/applications',{memberId:ME,clubId:$('#p_club').value.trim(),priority:$('#p_prio').value.trim()});toast(r.ok?('已提交 申请#'+r.data.id):(r.error||'失败'),r.ok);render();}
-async function processApp(){const r=await api('POST','/api/applications/process');toast(r.ok?('已处理 申请#'+r.data.id):(r.error||'无待审'),r.ok);render();}
+async function processApp(){const r=await api('POST','/api/applications/process');toast(r.ok?('下一条待审：申请#'+r.data.id+'，请点击通过或拒绝'):(r.error||'无待审'),r.ok);render();}
+async function withdraw(id){const r=await api('POST',`/api/applications/${id}/withdraw`,{memberId:ME});toast(r.ok?'已撤回':r.error,r.ok);render();}
 async function review(id,ok){const r=await api('POST',`/api/applications/${id}/review`,{approve:ok});toast(r.ok?(ok?'已通过':'已拒绝'):(r.error||'失败'),r.ok);render();}
 
 /* ---- 好友 ---- */
-async function renderFriends(){buildPicker();main.innerHTML=`
+async function renderFriends(){const version=renderVersion;buildPicker();if(version!==renderVersion)return;main.innerHTML=`
   <h2>好友关系（图）</h2>
   <div class="card"><h3>添加 / 删除好友</h3><div class="row">
     <input id="f_a" placeholder="成员A" style="width:90px"><input id="f_b" placeholder="成员B" style="width:90px">
@@ -256,7 +333,7 @@ async function pathQ(){const d=await api('GET',`/api/friends/${$('#q_a').value.t
 async function recAct(){const d=await api('GET',`/api/friends/${ME}/recact`);$('#qres').innerHTML='好友推荐活动：'+((d.recs||[]).map(r=>`活动#${r.actId}(热度${r.score})`).join('、')||'无');}
 
 /* ---- 排行 ---- */
-async function renderRank(){main.innerHTML=`
+async function renderRank(){const version=renderVersion;if(version!==renderVersion)return;main.innerHTML=`
   <h2>排行榜（AVL）</h2>
   <div class="card"><h3>查询</h3><div class="row">
     <input id="r_k" placeholder="Top-K" style="width:70px" value="10"><button class="btn" onclick="board()">活跃榜</button>
@@ -265,12 +342,12 @@ async function renderRank(){main.innerHTML=`
     <button class="btn gray" onclick="clubBoard()">社团活跃榜</button></div>
   <div id="rres" class="card"><span class="muted">点击上方按钮查询</span></div>`;}
 async function board(){const d=await api('GET','/api/rank/leaderboard?k='+($('#r_k').value||10));$('#rres').innerHTML='<h3>活跃榜</h3>'+((d.board||[]).map((p,i)=>`${i+1}. 成员#${p[1]} — ${p[0]} 分`).join('<br>')||'空');}
-async function myRank(){const d=await api('GET',`/api/rank/member/${$('#r_id').value||ME}`);$('#rres').innerHTML=`成员#${$('#r_id').value} 排名：${d.data&&d.data.rank!=null?d.data.rank:'—'}`;}
+async function myRank(){const d=await api('GET',`/api/rank/member/${$('#r_id').value||ME}`);$('#rres').innerHTML=`成员#${esc($('#r_id').value)} 排名：${d.data&&d.data.rank!=null?(d.data.rank<0?'未找到':d.data.rank+1):'—'}`;}
 async function rangeQ(){const d=await api('GET',`/api/rank/range?lo=${$('#r_lo').value}&hi=${$('#r_hi').value}`);$('#rres').innerHTML=`活跃度区间内人数：${d.data&&d.data.count!=null?d.data.count:'—'}`;}
 async function clubBoard(){const d=await api('GET','/api/rank/clubleader?k=10');$('#rres').innerHTML='<h3>社团活跃榜</h3>'+((d.board||[]).map((p,i)=>`${i+1}. 社团#${p[1]} — ${p[0]} 分`).join('<br>')||'空');}
 
 /* ---- 公告 ---- */
-async function renderAnnounce(){buildPicker();main.innerHTML=`
+async function renderAnnounce(){const version=renderVersion;buildPicker();if(version!==renderVersion)return;main.innerHTML=`
   <h2>公告广播</h2>
   <div class="card"><h3>发布公告（以我的身份，发到我所在社团）</h3><div class="row">
     <input id="an_club" placeholder="社团ID" style="width:90px"><input id="an_msg" placeholder="公告内容" style="width:300px">
@@ -286,8 +363,12 @@ function showAnn(list){$('#anres').innerHTML='<h3>公告</h3>'+(list.map(a=>`[�
 
 $('#undo').onclick=async()=>{const r=await api('POST','/api/undo');toast(r.ok?'已撤销':(r.error||'无可撤销'),r.ok);render();};
 $('#redo').onclick=async()=>{const r=await api('POST','/api/redo');toast(r.ok?'已重做':(r.error||'无可重做'),r.ok);render();};
+$('#refresh').onclick=async()=>{await refreshMe();render();};
 $('#save').onclick=async()=>{const r=await api('POST','/api/save');toast(r.ok?'已保存':'保存失败',r.ok);};
-buildNav();refreshMe().then(render);
+$('#logout').onclick=async()=>{const r=await api('POST','/api/auth/logout');if(r.ok)showLogin(true);};
+$('#password').onclick=()=>passwordDialog();
+boot().catch(()=>{main.innerHTML='<section class="card empty">无法连接服务，请刷新页面重试。</section>';});
+window.addEventListener('unhandledrejection',e=>{e.preventDefault();});
 </script>
 </body>
 </html>)CLUBGUI";
@@ -304,7 +385,7 @@ static std::string urlDecode(const std::string& s) {
             out.push_back((char)strtol(hex, nullptr, 16));
             i += 2;
         } else {
-            out.push_back(s[i]);
+            out.push_back(s[i] == '+' ? ' ' : s[i]);
         }
     }
     return out;
@@ -333,8 +414,10 @@ static std::string jsonEscape(const std::string& s) {
     return out;
 }
 
-static int toInt(const std::string& s, int def = 0) {
-    try { return std::stoi(s); } catch (...) { return def; }
+static int toInt(const std::string& s) {
+    size_t used = 0; int value = std::stoi(s, &used);
+    if (used != s.size()) throw std::invalid_argument("invalid integer");
+    return value;
 }
 
 // 按 , ， ; ； 空格 切分标签
@@ -399,12 +482,18 @@ static void sendAll(sock_t s, const std::string& data) {
 }
 
 static void httpResponse(sock_t s, int code, const std::string& status,
-                         const std::string& contentType, const std::string& body) {
+                         const std::string& contentType, const std::string& body,
+                         const std::string& extraHeaders = "") {
     std::ostringstream os;
     os << "HTTP/1.1 " << code << " " << status << "\r\n"
        << "Content-Type: " << contentType << "; charset=utf-8\r\n"
        << "Content-Length: " << body.size() << "\r\n"
        << "Connection: close\r\n"
+       << "Cache-Control: no-store\r\n"
+       << "X-Content-Type-Options: nosniff\r\n"
+       << "X-Frame-Options: DENY\r\n"
+       << "Referrer-Policy: same-origin\r\n"
+       << extraHeaders
        << "\r\n" << body;
     sendAll(s, os.str());
 }
@@ -438,30 +527,40 @@ static std::string memberJson(const Member& m) {
     js << "]}";
     return js.str();
 }
-static std::string clubJson(const Club& c) {
+static std::string clubJson(const Club& c, int viewer = -1) {
     std::ostringstream js;
     js << "{\"id\":" << c.id << ",\"name\":\"" << jsonEscape(c.name)
        << "\",\"category\":\"" << jsonEscape(c.category)
        << "\",\"founded\":\"" << jsonEscape(c.founded)
        << "\",\"description\":\"" << jsonEscape(c.description)
        << "\",\"parentClub\":" << c.parentClub << ",\"memberIds\":[";
-    for (size_t j = 0; j < c.memberIds.size(); ++j) { if (j) js << ","; js << c.memberIds[j]; }
+    bool first = true;
+    for (int id : c.memberIds) { if (viewer >= 0 && id != viewer) continue; if (!first) js << ','; first = false; js << id; }
     js << "],\"subClubs\":[";
     for (size_t j = 0; j < c.subClubs.size(); ++j) { if (j) js << ","; js << c.subClubs[j]; }
     js << "]}";
     return js.str();
 }
-static std::string activityJson(const Activity& a) {
+static std::string activityJson(const Activity& a, int viewer = -1) {
     std::ostringstream js;
     js << "{\"id\":" << a.id << ",\"clubId\":" << a.clubId
        << ",\"name\":\"" << jsonEscape(a.name)
        << "\",\"time\":\"" << jsonEscape(a.time)
        << "\",\"capacity\":" << a.capacity
+       << ",\"signedCount\":" << a.signedUp.size() << ",\"waitingCount\":" << a.waitlist.size()
        << ",\"signedUp\":[";
-    for (size_t j = 0; j < a.signedUp.size(); ++j) { if (j) js << ","; js << a.signedUp[j]; }
+    bool first = true;
+    for (int id : a.signedUp) { if (viewer >= 0 && id != viewer) continue; if (!first) js << ','; first = false; js << id; }
     js << "],\"requiredTags\":[";
     for (size_t j = 0; j < a.requiredTags.size(); ++j) { if (j) js << ","; js << "\"" << jsonEscape(a.requiredTags[j]) << "\""; }
-    js << "],\"day\":" << a.day << ",\"startMin\":" << a.startMin
+    js << "],\"waitlist\":[";
+    first = true;
+    for (const auto& p : a.waitlist.snapshot()) { if (viewer >= 0 && p.second != viewer) continue; if (!first) js << ','; first = false; js << p.second; }
+    js << "],\"checkedIn\":[";
+    first = true;
+    for (int id : a.checkedIn) { if (viewer >= 0 && id != viewer) continue; if (!first) js << ','; first = false; js << id; }
+    js << "],\"closed\":" << (a.closed ? "true" : "false");
+    js << ",\"day\":" << a.day << ",\"startMin\":" << a.startMin
        << ",\"endMin\":" << a.endMin << ",\"timed\":" << (a.timed() ? "true" : "false") << "}";
     return js.str();
 }
@@ -499,14 +598,17 @@ static std::vector<Announcement> allAnnouncements(ClubSystem& sys) {
 // ---------------------------------------------------------------------------
 // 路由：method + path + query + body -> JSON 响应
 // ---------------------------------------------------------------------------
+#include "web_auth.inc"
+
 static void routeAndRespond(sock_t s, const std::string& method,
                             const std::string& path, const std::string& query,
-                            const std::string& body, ClubSystem& sys) {
+                            const std::string& body, ClubSystem& sys, AuthStore& auth,
+                            const std::map<std::string, std::string>& headers, const std::string& client) {
     std::vector<std::string> seg = splitPath(path);
     Form q = parseForm(query);
     Form f = parseForm(body);
     std::string resp;
-    auto saved = [&]() { sys.save(SAVE_FILE); };   // 写操作后自动存档
+    auto saved = [&]() { if (!sys.save(SAVE_FILE)) resp = jErr("操作已生效，但存档失败；请检查目录权限并重新保存"); };   // 写操作后自动存档
 
     // GET / -> 前端页面
     if (method == "GET" && seg.empty()) {
@@ -514,17 +616,43 @@ static void routeAndRespond(sock_t s, const std::string& method,
         return;
     }
 
+    // 默认拒绝；普通成员的全部路由在这里处理，只有管理员进入下方管理路由。
+    if (authorizeAndRespond(s, method, seg, f, sys, auth, headers, client)) return;
+
     if (!seg.empty() && seg[0] == "api") {
+        if (seg.size() == 2 && seg[1] == "stats" && method == "GET") {
+            auto st = sys.statistics();
+            std::ostringstream js;
+            js << "{\"members\":" << st.members << ",\"clubs\":" << st.clubs
+               << ",\"activities\":" << st.activities << ",\"closedActivities\":" << st.closedActivities
+               << ",\"registrations\":" << st.registrations << ",\"waiting\":" << st.waiting
+               << ",\"checkIns\":" << st.checkIns << ",\"pending\":" << st.pending
+               << ",\"totalScore\":" << st.totalScore << '}';
+            resp = jOk(js.str());
+        } else if (seg.size() == 3 && seg[1] == "schedule" && method == "GET") {
+            int id = toInt(seg[2]);
+            if (!sys.findMember(id)) throw std::invalid_argument("member not found");
+            std::ostringstream js; js << "{\"activities\":[";
+            bool first = true;
+            for (int aid : sys.memberSchedule(id)) { if (!first) js << ','; first = false; js << activityJson(*sys.findActivity(aid)); }
+            js << "]}"; resp = jOk(js.str());
+        } else if (seg.size() == 3 && seg[1] == "export" && seg[2] == "members" && method == "GET") {
+            httpResponse(s, 200, "OK", "text/csv", sys.exportMembersCsv()); return;
+        } else if (seg.size() == 4 && seg[1] == "activities" && seg[3] == "export" && method == "GET") {
+            auto csv = sys.exportRosterCsv(toInt(seg[2]));
+            if (csv.empty()) { httpResponse(s, 404, "Not Found", "application/json", jErr("活动不存在")); return; }
+            httpResponse(s, 200, "OK", "text/csv", csv); return;
+        }
         // ============ 成员 ============
-        if (seg.size() >= 2 && seg[1] == "members") {
+        else if (seg.size() >= 2 && seg[1] == "members") {
             if (seg.size() == 2) {
                 if (method == "GET") {
                     std::ostringstream js; js << "{\"members\":[";
                     const auto& ms = sys.members();
                     for (size_t i = 0; i < ms.size(); ++i) { if (i) js << ","; js << memberJson(ms[i]); }
-                    js << "]";
+                    js << "]}";
                     resp = jOk(js.str());
-                } else {  // POST 添加
+                } else if (method == "POST") {  // 添加
                     std::string name = formGet(f, "name"), grade = formGet(f, "grade");
                     std::vector<std::string> tags = splitTags(formGet(f, "tags"));
                     int id = sys.addMember(name, grade, tags);
@@ -554,6 +682,7 @@ static void routeAndRespond(sock_t s, const std::string& method,
             } else if (seg.size() == 4 && method == "POST") {  // /api/members/{id}/{action}
                 int id = toInt(seg[2]);
                 if (seg[3] == "score") {
+                    if (!sys.findMember(id)) throw std::invalid_argument("member not found");
                     sys.addScore(id, toInt(formGet(f, "delta")));
                     resp = jOk("{}"); saved();
                 } else if (seg[3] == "tag") {
@@ -579,9 +708,9 @@ static void routeAndRespond(sock_t s, const std::string& method,
                 if (method == "GET") {
                     std::ostringstream js; js << "{\"clubs\":[";
                     const auto& cs = sys.clubs();
-                    for (size_t i = 0; i < cs.size(); ++i) { if (i) js << ","; js << clubJson(cs[i]); }
+                    bool first = true; for (const auto& c : cs) { if (!c.active) continue; if (!first) js << ","; first = false; js << clubJson(c); }
                     js << "]}"; resp = jOk(js.str());
-                } else {
+                } else if (method == "POST") {
                     std::string name = formGet(f, "name");
                     std::string parent = formGet(f, "parentId");
                     int id = parent.empty()
@@ -593,7 +722,7 @@ static void routeAndRespond(sock_t s, const std::string& method,
             } else if (seg.size() == 3 && method == "DELETE") {
                 bool ok = sys.removeClub(toInt(seg[2]));
                 resp = ok ? jOk("{}") : jErr("删除失败（有在册成员或子部门）"); if (ok) saved();
-            } else if (seg.size() == 4 && seg[2] == "org" && method == "GET") {
+            } else if (seg.size() == 3 && seg[2] == "org" && method == "GET") {
                 auto lines = sys.orgTreeLines();
                 std::ostringstream js; js << "{\"lines\":[";
                 for (size_t i = 0; i < lines.size(); ++i) { if (i) js << ","; js << "\"" << jsonEscape(lines[i]) << "\""; }
@@ -612,17 +741,17 @@ static void routeAndRespond(sock_t s, const std::string& method,
                 if (method == "GET") {
                     std::ostringstream js; js << "{\"activities\":[";
                     const auto& as = sys.activities();
-                    for (size_t i = 0; i < as.size(); ++i) { if (i) js << ","; js << activityJson(as[i]); }
+                    bool first = true; for (const auto& a : as) { if (!a.active) continue; if (!first) js << ","; first = false; js << activityJson(a); }
                     js << "]}"; resp = jOk(js.str());
-                } else {
+                } else if (method == "POST") {
                     int clubId = toInt(formGet(f, "clubId"));
                     std::string name = formGet(f, "name");
                     int cap = toInt(formGet(f, "capacity"));
                     std::string time = formGet(f, "time");
                     std::string rtags = formGet(f, "requiredTags");
                     std::string day = formGet(f, "day"), sm = formGet(f, "startMin"), em = formGet(f, "endMin");
-                    int id;
-                    if (!day.empty() && !sm.empty() && !em.empty()) {
+                    int id = -1;
+                    if (!day.empty() || !sm.empty() || !em.empty()) {
                         id = sys.addActivity(clubId, name, time, cap, splitTags(rtags),
                                              toInt(day), toInt(sm), toInt(em));
                     } else {
@@ -634,9 +763,16 @@ static void routeAndRespond(sock_t s, const std::string& method,
             } else if (seg.size() == 3 && method == "DELETE") {
                 bool ok = sys.removeActivity(toInt(seg[2]));
                 resp = ok ? jOk("{}") : jErr("删除失败"); if (ok) saved();
+            } else if (seg.size() == 4 && seg[3] == "checkin" && method == "POST") {
+                bool ok = sys.checkIn(toInt(formGet(f, "memberId")), toInt(seg[2]));
+                resp = ok ? jOk("{}") : jErr("签到失败：仅正取成员可签到一次，活动须未结束且积分未溢出"); if (ok) saved();
+            } else if (seg.size() == 4 && seg[3] == "close" && method == "POST") {
+                bool ok = sys.closeActivity(toInt(seg[2]));
+                resp = ok ? jOk("{}") : jErr("活动不存在或已结束"); if (ok) saved();
             } else if (seg.size() == 4 && seg[3] == "signup" && method == "POST") {
                 std::string msg = sys.signup(toInt(formGet(f, "memberId")), toInt(seg[2]));
-                resp = jOk("{\"message\":\"" + jsonEscape(msg) + "\"}"); saved();
+                bool ok = msg.rfind("成功", 0) == 0;
+                resp = ok ? jOk("{\"message\":\"" + jsonEscape(msg) + "\"}") : jErr(msg); if (ok) saved();
             } else if (seg.size() == 4 && seg[3] == "cancel" && method == "POST") {
                 bool ok = sys.cancelSignup(toInt(formGet(f, "memberId")), toInt(seg[2]));
                 resp = ok ? jOk("{}") : jErr("取消失败"); if (ok) saved();
@@ -658,7 +794,7 @@ static void routeAndRespond(sock_t s, const std::string& method,
                     const auto& as = sys.applications();
                     for (size_t i = 0; i < as.size(); ++i) { if (i) js << ","; js << appJson(as[i]); }
                     js << "]}"; resp = jOk(js.str());
-                } else {
+                } else if (method == "POST") {
                     std::string p = formGet(f, "priority");
                     int id = sys.submitApplication(toInt(formGet(f, "memberId")), toInt(formGet(f, "clubId")),
                                                    p.empty() ? 0 : toInt(p));
@@ -671,7 +807,11 @@ static void routeAndRespond(sock_t s, const std::string& method,
                 else { resp = jOk("{\"id\":" + std::to_string(id) + "}"); saved(); }
             } else if (seg.size() == 3 && seg[2] == "pending" && method == "GET") {
                 resp = jOk("{\"count\":" + std::to_string(sys.pendingCount()) + "}");
+            } else if (seg.size() == 4 && seg[3] == "withdraw" && method == "POST") {
+                bool ok = sys.withdrawApplication(toInt(seg[2]), toInt(formGet(f, "memberId")));
+                resp = ok ? jOk("{}") : jErr("只能撤回本人待审申请"); if (ok) saved();
             } else if (seg.size() == 4 && seg[3] == "review" && method == "POST") {
+                if (formGet(f, "approve") != "true" && formGet(f, "approve") != "false") throw std::invalid_argument("invalid approval");
                 bool ok = sys.reviewApplication(toInt(seg[2]), formGet(f, "approve") == "true");
                 resp = ok ? jOk("{}") : jErr("审批失败"); if (ok) saved();
             } else resp = jErr("未知路由");
@@ -679,7 +819,9 @@ static void routeAndRespond(sock_t s, const std::string& method,
         // ============ 好友 ============
         else if (seg.size() >= 2 && seg[1] == "friends") {
             if (seg.size() == 2 && method == "POST") {
-                sys.addFriend(toInt(formGet(f, "a")), toInt(formGet(f, "b")));
+                int x = toInt(formGet(f, "a")), y = toInt(formGet(f, "b"));
+                if (x == y || !sys.findMember(x) || !sys.findMember(y)) throw std::invalid_argument("invalid friend");
+                sys.addFriend(x, y);
                 resp = jOk("{}"); saved();
             } else if (seg.size() == 2 && method == "DELETE") {
                 bool ok = sys.removeFriend(toInt(formGet(f, "a")), toInt(formGet(f, "b")));
@@ -704,7 +846,7 @@ static void routeAndRespond(sock_t s, const std::string& method,
             } else resp = jErr("未知路由");
         }
         // ============ 排行 ============
-        else if (seg.size() >= 2 && seg[1] == "rank") {
+        else if (seg.size() >= 3 && seg[1] == "rank") {
             if (seg[2] == "leaderboard" && method == "GET") {
                 auto v = sys.leaderboard(toInt(formGet(q, "k", "10")));
                 std::ostringstream js; js << "{\"board\":[";
@@ -729,7 +871,7 @@ static void routeAndRespond(sock_t s, const std::string& method,
                     std::ostringstream js; js << "{\"announcements\":[";
                     for (size_t i = 0; i < v.size(); ++i) { if (i) js << ","; js << annJson(v[i]); }
                     js << "]}"; resp = jOk(js.str());
-                } else {
+                } else if (method == "POST") {
                     int id = sys.broadcast(toInt(formGet(f, "clubId")), toInt(formGet(f, "senderId")), formGet(f, "message"));
                     if (id < 0) resp = jErr("广播失败");
                     else { resp = jOk("{\"id\":" + std::to_string(id) + "}"); saved(); }
@@ -748,9 +890,9 @@ static void routeAndRespond(sock_t s, const std::string& method,
         }
         // ============ 撤销 / 重做 / 状态 / 存读档 ============
         else if (seg.size() == 2 && seg[1] == "undo" && method == "POST") {
-            resp = sys.undo() ? jOk("{}") : jErr("无可撤销");
+            bool ok = sys.undo(); resp = ok ? jOk("{}") : jErr("无可撤销"); if (ok) saved();
         } else if (seg.size() == 2 && seg[1] == "redo" && method == "POST") {
-            resp = sys.redo() ? jOk("{}") : jErr("无可重做");
+            bool ok = sys.redo(); resp = ok ? jOk("{}") : jErr("无可重做"); if (ok) saved();
         } else if (seg.size() == 2 && seg[1] == "state" && method == "GET") {
             resp = jOk(std::string("{\"canUndo\":") + (sys.canUndo() ? "true" : "false") +
                        ",\"canRedo\":" + (sys.canRedo() ? "true" : "false") + "}");
@@ -764,6 +906,7 @@ static void routeAndRespond(sock_t s, const std::string& method,
         return;
     }
 
+    if (resp.empty()) resp = jErr("不支持的请求方法");
     httpResponse(s, 200, "OK", "application/json", resp);
 }
 
@@ -779,9 +922,11 @@ static std::string readRequest(sock_t s) {
         if (n <= 0) break;
         buf.append(tmp, (size_t)n);
         headerEnd = buf.find("\r\n\r\n");
+        if (headerEnd == std::string::npos && buf.size() > 16384) return "";
     }
     if (headerEnd == std::string::npos) return "";
     size_t cl = getContentLength(buf.substr(0, headerEnd));
+    if (cl > 1024 * 1024) return "";
     size_t bodyStart = headerEnd + 4;
     size_t have = buf.size() - bodyStart;
     while (have < cl) {
@@ -790,7 +935,7 @@ static std::string readRequest(sock_t s) {
         buf.append(tmp, (size_t)n);
         have += (size_t)n;
     }
-    return buf;
+    return have < cl ? "" : buf;
 }
 
 static void parseRequest(const std::string& buf, std::string& method,
@@ -810,14 +955,40 @@ static void parseRequest(const std::string& buf, std::string& method,
     body = buf.substr(bodyStart, cl);
 }
 
-static void handleClient(sock_t s, ClubSystem& sys) {
+static void handleClient(sock_t s, ClubSystem& sys, AuthStore& auth, std::string client) {
     std::string buf = readRequest(s);
     if (buf.empty()) { SOCK_CLOSE_(s); return; }
     std::string method, path, query, body;
     parseRequest(buf, method, path, query, body);
+    // 普通网页不能借表单向本机服务提交写入；命令行客户端可以不发送 Origin。
+    std::map<std::string, std::string> requestHeaders;
+    {
+        std::istringstream headers(buf.substr(0, buf.find("\r\n\r\n")));
+        std::string line, host, origin;
+        while (std::getline(headers, line)) {
+            auto colon = line.find(':');
+            if (colon == std::string::npos) continue;
+            auto key = line.substr(0, colon);
+            std::transform(key.begin(), key.end(), key.begin(), [](unsigned char c) { return static_cast<char>(std::tolower(c)); });
+            auto value = line.substr(colon + 1);
+            auto first = value.find_first_not_of(" \t");
+            value = first == std::string::npos ? "" : value.substr(first);
+            if (!value.empty() && value.back() == '\r') value.pop_back();
+            if (key == "host") host = value;
+            if (key == "origin") origin = value;
+            if (requestHeaders.count(key)) { SOCK_CLOSE_(s); return; }
+            requestHeaders[key] = value;
+        }
+        const std::string scheme = std::getenv("CLUB_SECURE_COOKIE") ? "https://" : "http://";
+        if (method != "GET" && !origin.empty() && origin != scheme + host) {
+            httpResponse(s, 403, "Forbidden", "application/json", jErr("不接受其他网站发起的写入请求"));
+            SOCK_CLOSE_(s); return;
+        }
+    }
     {
         std::lock_guard<std::mutex> lk(g_mutex);
-        routeAndRespond(s, method, path, query, body, sys);
+        try { routeAndRespond(s, method, path, query, body, sys, auth, requestHeaders, client); }
+        catch (const std::exception&) { httpResponse(s, 400, "Bad Request", "application/json", jErr("参数格式错误：请检查整数、必填字段与请求路径")); }
     }
     SOCK_CLOSE_(s);
 }
@@ -842,34 +1013,28 @@ static void openBrowser(const std::string& url) {
     std::string cmd = "xdg-open '" + url + "' >/dev/null 2>&1 &";
     if (system(cmd.c_str()) == 0) return;
     std::string cmd2 = "open '" + url + "' >/dev/null 2>&1 &";
-    system(cmd2.c_str());
-#endif
-}
-
-// 首次运行尝试放行端口（一次性，用标记文件避免重复弹 UAC；失败不致命）
-static void tryAddFirewallRule() {
-#ifdef _WIN32
-    {
-        std::ifstream mark("club_fw_added.flag");
-        if (mark.good()) return;   // 已处理过，不再弹 UAC
-    }
-    std::string params = "advfirewall firewall add rule name=\"ClubManager\" dir=in action=allow protocol=TCP localport=" +
-                         std::to_string(PORT);
-    std::wstring wparams(params.begin(), params.end());
-    ShellExecuteW(NULL, L"runas", L"netsh", wparams.c_str(), NULL, SW_HIDE);  // 提权，弹一次 UAC
-    std::ofstream("club_fw_added.flag") << "1";   // 标记已尝试，下次不再弹
+    if (system(cmd2.c_str()) != 0) std::cerr << "请在浏览器中打开 " << url << '\n';
 #endif
 }
 
 void startGui(ClubSystem& sys) {
+    const int PORT = serverPort();
+    AuthStore auth;
+#ifndef _WIN32
+    // A browser can cancel a request while sendAll is writing its response.
+    // Treat that as a failed socket write, not a signal that kills the server.
+    std::signal(SIGPIPE, SIG_IGN);
+#endif
 #ifdef _WIN32
+    SetConsoleOutputCP(CP_UTF8);   // 控制台输出切到 UTF-8，避免中文横幅在 GBK 控制台乱码
+    SetConsoleCP(CP_UTF8);
     WSADATA wsa;
     WSAStartup(MAKEWORD(2, 2), &wsa);
 #endif
     // 载入已有存档
     {
         std::ifstream test(SAVE_FILE);
-        if (test.good()) { test.close(); sys.load(SAVE_FILE); }
+        if (test.good()) { test.close(); if (!sys.load(SAVE_FILE)) throw std::runtime_error("存档损坏，启动已停止；原文件未改动"); }
     }
 
     sock_t srv = socket(AF_INET, SOCK_STREAM, 0);
@@ -883,7 +1048,7 @@ void startGui(ClubSystem& sys) {
     sockaddr_in addr;
     memset(&addr, 0, sizeof(addr));
     addr.sin_family = AF_INET;
-    addr.sin_addr.s_addr = htonl(INADDR_ANY);   // 0.0.0.0：监听所有网卡，局域网可访问
+    addr.sin_addr.s_addr = htonl(std::getenv("CLUB_LAN") ? INADDR_ANY : INADDR_LOOPBACK);
     addr.sin_port = htons((u_short)PORT);
     if (bind(srv, (sockaddr*)&addr, sizeof(addr)) < 0) {
         std::cerr << "端口 " << PORT << " 被占用\n"; SOCK_CLOSE_(srv); return;
@@ -898,22 +1063,35 @@ void startGui(ClubSystem& sys) {
               << "  本机访问:   " << url << "\n"
               << "  局域网访问: http://" << ip << ":" << PORT << "/\n"
               << "  (同一 Wi-Fi/局域网的人用上面这个 IP 访问)\n"
-              << "  若局域网访问不通：首次运行会弹 UAC 放行端口，或手动以管理员运行\n"
+              << "  若局域网访问不通：先设置 CLUB_LAN=1；必要时手动配置防火墙\n"
               << "  netsh advfirewall firewall add rule name=ClubManager dir=in action=allow protocol=TCP localport=" << PORT << "\n"
               << "  按 Ctrl+C 退出\n"
               << "========================================\n\n";
     std::cout.flush();
+    if (!auth.initialized()) std::cout << "  请先停止服务并运行 club auth init admin 初始化管理员，然后重新启动。\n";
 
-    // 设 CLUB_NO_BROWSER=1 可跳过自动开浏览器/防火墙弹窗（用于无界面环境或测试）
+    // 设 CLUB_NO_BROWSER=1 可跳过自动打开浏览器（用于无界面环境或测试）
     if (!getenv("CLUB_NO_BROWSER")) {
-        tryAddFirewallRule();
         openBrowser(url);
     }
 
     while (true) {
-        sock_t c = accept(srv, nullptr, nullptr);
+        sockaddr_in peer{};
+#ifdef _WIN32
+        int peerLength = sizeof(peer);
+#else
+        socklen_t peerLength = sizeof(peer);
+#endif
+        sock_t c = accept(srv, reinterpret_cast<sockaddr*>(&peer), &peerLength);
         if (c == SOCK_BAD_) continue;
-        std::thread(handleClient, c, std::ref(sys)).detach();
+#ifdef _WIN32
+        DWORD timeout = 5000;
+        setsockopt(c, SOL_SOCKET, SO_RCVTIMEO, reinterpret_cast<const char*>(&timeout), sizeof(timeout));
+#else
+        timeval timeout{5, 0};
+        setsockopt(c, SOL_SOCKET, SO_RCVTIMEO, &timeout, sizeof(timeout));
+#endif
+        std::thread(handleClient, c, std::ref(sys), std::ref(auth), std::string(inet_ntoa(peer.sin_addr))).detach();
     }
     SOCK_CLOSE_(srv);
 #ifdef _WIN32

@@ -16,6 +16,7 @@ struct Member {
     long long joinSeq = 0; // 加入序号（用于确定性排序）
     std::vector<std::string> tags;  // 技能/兴趣标签（用于倒排索引）
     bool active = true;    // 逻辑删除标记
+    std::string accountKey; // 可选的稳定账号绑定标识，不随普通 ID 重用
 };
 
 // 社团
@@ -46,6 +47,9 @@ struct Activity {
     int startMin = -1;   // 自 00:00 起的分钟数
     int endMin = -1;
     bool active = true;
+
+    std::vector<int> checkedIn;  // 已签到者；每人每活动奖励 10 分
+    bool closed = false;        // 已结束活动保留历史，不再占用日程
 
     bool timed() const { return day >= 0 && startMin >= 0 && endMin >= 0; }
 };

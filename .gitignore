@@ -5,3 +5,14 @@
 
 # 运行时自动存档
 club_data.txt
+club_accounts.txt
+club_fw_added.flag
+__pycache__/
+.club-launcher.lock
+.club-service.log
+*.tmp.*
+
+# 本机协作记录与桌面入口
+/PROJECT_MEMORY.md
+/AGENTS.md
+*.lnk
