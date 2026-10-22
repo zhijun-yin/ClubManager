@@ -29,7 +29,7 @@ private:
 template <typename T>
 class Queue {
 public:
-    explicit Queue(size_t capacity = 16) : buf_(capacity), cap_(capacity) {}
+    explicit Queue(size_t capacity = 16) : buf_(capacity ? capacity : 1), cap_(capacity ? capacity : 1) {}
 
     bool push(const T& v) {
         if (size_ == cap_) {

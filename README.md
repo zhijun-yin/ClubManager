@@ -1,278 +1,217 @@
-# 社团管理系统 ClubManager
+# ClubManager 社团管理系统
 
-> 一个用 **C++17** 实现的社团管理命令行系统，把课程常见的几种数据结构
-> （哈希表、AVL 平衡树、二叉堆、栈、队列、图、**倒排索引**）整合进一个真实可运行、
-> 可测试的应用场景：成员 / 社团（含层级部门）/ 活动（含时间段与标签）/ 入社审批 /
-> 好友关系，并支持活跃度排行、候补自动提拔、优先级审批、撤销 / 重做、公告广播、
-> 批量导入、持久化等。
+面向校园社团负责人和成员的 C++17 应用。把成员管理、入社审批、活动报名、候补、签到和社交关系放在同一套数据中；提供中文命令行和无外部前端依赖的浏览器界面。
 
-本项目是数据结构课程作业的第二个作品（第一个是 `RelationshipNetworkAnalyzer`，
-关系网络分析工具）。二者都强调：**用合适的数据结构支撑真实功能，并可被测试验证**。
+## 可以做什么
 
----
+- **管理成员与组织**：成员标签、CSV 批量导入、姓名与标签检索、社团和子部门、入社和退社。
+- **组织活动**：容量管理、按当前积分选择候补、报名资格检查、每周时间段冲突检测、正取与候补名单查看。
+- **记录参与**：正取成员每场活动签到一次，自动奖励 10 分；结束活动后保留名单和签到历史。
+- **个人日程**：查看本人正取、候补、已签到及已结束活动，按星期与开始时间排序。
+- **处理申请**：高优先级先处理，同优先级按提交顺序；防止重复申请，支持本人撤回。
+- **观察社团运行**：统计总览、报名进度、成员 Top-K、个人排名、区间人数、社团积分排行。
+- **关系与公告**：好友关系、二度人脉、最短关系路径、好友活动推荐、社团公告。
+- **管理数据**：完整操作撤销/重做、成员与活动名单 CSV 导出、自动存档、兼容旧示例存档。
+- **账号与权限**：密码登录、管理员/普通成员角色、成员绑定、启停账号、改角色、重置密码；普通成员只能操作自己的报名、签到和入社申请。
 
-## 1. 功能一览
+![统计总览](docs/dashboard.png)
 
-| 模块 | 功能 | 背后的数据结构 |
-|------|------|----------------|
-| 成员管理 | 注册（查重名）、删除（带保护）、活跃度增减、按姓名查、**打 / 删标签**、**批量导入 CSV** | 哈希表（姓名→id）、**倒排索引（标签→成员）** |
-| 标签检索 | 单词查询、**多标签 AND / OR 查询**、列出全部标签 | **倒排索引 + 有序归并** |
-| 社团管理 | 创建（重名校验）、**子部门（层级树）**、删除（有在册成员 / 子部门则拒绝）、入社 / 退社、**组织架构 DFS 打印** | 向量 + 哈希表 + **DFS** |
-| 活动管理 | 创建（可带**结构化时间段**与**所需标签**）、报名、**满员进候补**、**取消 / 缩容自动提拔**、**时间段冲突检测** | 向量 + **二叉堆（大顶堆，按活跃度）** |
-| 入社审批 | 提交申请、**按优先级 + 提交顺序处理**、通过 / 拒绝 | **优先队列（大顶堆）** |
-| 好友关系 | 加好友 / 删好友、**二度人脉推荐**、**最短关系距离**、**最短社交路径** | **图（邻接表 + BFS）** |
-| 好友驱动推荐 | 依据好友参加的活动为成员推荐活动 | 图 + 哈希计数 |
-| 排行榜 | **Top-K 活跃度**、**个人排名**、**区间活跃人数**、**社团活跃度排行** | **AVL 平衡树（关键字 (score,id)）** |
-| 公告广播 | 向社团发布公告，**按成员所在社团投递** | 向量 + 序号排序 |
-| 撤销 / 重做 | 上一步回退 / 重做（加成员 / 加分会 / 审批 / 加好友 / 打标签 / 广播 / 导入等） | **双栈 + 命令模式** |
-| 持久化 | 存档 / 读档（文本格式，含全部新字段） | 序列化 + 各索引重建 |
+## 推荐运行方式（Windows + WSL）
 
-> **图形界面（多人共用）**：除命令行外，运行 `club gui` 启动一个本地 Web 图形界面，
-> 团队成员在各自浏览器访问同一地址即可**实时协作修改同一套数据**（详见下文「图形界面」一节）。
+本项目后续以 WSL Ubuntu 24.04 为主要开发环境。C++ 服务运行在 Linux 中，Windows 浏览器访问本机页面；无需关闭 Windows 智能应用控制。
 
-### 设计要点
+**日常使用：双击 `启动社团管理.cmd`，停止时双击 `停止社团管理.cmd`。** 首次启动会在窗口里引导设置管理员 `admin` 的密码（输入两次，输入时不显示）；之后双击即可自动准备构建、启动服务并用 Windows 默认浏览器打开 `http://127.0.0.1:8090/`。网页就绪后启动窗口自动关闭，服务在 WSL 后台继续运行；无需保留命令行窗口。再次双击启动只打开现有网页；端口被其他服务占用时会明确报错。
 
-- **id = 向量下标**：成员 / 社团 / 活动都用 `vector` 存储，`id` 即下标，实现 O(1) 访问。
-- **逻辑删除**：删除只是把 `active` 置 false，不移动向量，从而保持 `id == 下标` 不变量。
-- **AVL 作有序索引**：以 `(score, id)` 为关键字，支持排名 / Top-K / 区间计数，均为 O(log n)。
-- **候补用大顶堆**：`(活跃度, 成员id)` 入堆，满员时活跃度最高者优先；取消名额 / 缩容时 O(log n) 提拔。
-  - 注意：堆内 `score` 是**报名时刻**的快照，提拔时按**当前**活跃度重新择优，保证增减活跃度后立即生效。
-- **倒排索引**：标签 → 升序去重的成员 id 列表（有序数组），AND 查询用**双路归并求交**、OR 查询用 `std::merge` 求并。
-- **优先队列审批**：待审申请按 `(优先级, 提交序号)` 大顶堆排序，高优先级先审、同优先级先提交者先审。
-- **撤销 / 重做用双栈 + 命令模式**：每个修改操作同时记录逆操作与顺操作两个闭包，压入撤销栈；撤销弹栈执行逆操作并压入重做栈，重做反之。任何新修改会清空重做栈。
-- **时间段冲突检测**：活动可带 `day` 与起止分钟数，报名前用区间重叠判断 `[s1,e1)∩[s2,e2)` 拒绝撞车。
+这两个入口控制项目根目录的正式服务，与 8091 演示环境独立。可分别发送到桌面快捷方式；共用代码、账号和数据，不复制程序。停止时核对进程启动时间、可执行文件和数据目录，只结束匹配服务，不关闭整个 WSL。重复停止会提示未运行。运行日志 `.club-service.log` 每次启动覆盖，不累积历史日志；错误时启动窗口会保留提示，不修改 Windows 安全策略。
 
----
+已有 `Ubuntu-24.04`、`g++`、CMake、Python 3 时，在项目目录运行：
 
-## 2. 数据结构与复杂度
-
-| 数据结构 | 实现位置 | 关键操作 | 复杂度 |
-|----------|----------|----------|--------|
-| 哈希表（链地址） | `hash_map.{h,cpp}` | put / get / contains / remove / rehash | 平均 O(1)，最坏 O(n) |
-| AVL 平衡树 | `avl.{h,cpp}` | insert / remove / topK / rankOf / rangeCount | O(log n)，Top-K O(k+log n) |
-| 二叉堆（大顶堆） | `heap.h` | push / pop / top / clear | O(log n) |
-| 倒排索引 | `inverted_index.{h,cpp}` | add / remove / queryAnd / queryOr | 增删 O(log n)，AND/OR O(总词表长度) |
-| 顺序栈 | `containers.h` | push / pop / top | O(1) |
-| 循环队列 | `containers.h` | push / pop / front（自动扩容） | O(1) |
-| 无向图 + BFS | `friend_graph.{h,cpp}` | addFriend / removeFriend / recommend / friendDistance / path | 增删 O(deg)，BFS O(V+E) |
-
-> 所有平衡树 / 堆 / 哈希表 / 倒排索引 / 图均**自行实现**，未使用 `std::set` /
-> `std::map` / `std::priority_queue` / `std::unordered_map`，以体现对底层结构的掌握。
-
----
-
-## 3. 项目结构
-
-```
-ClubManager/
-├── include/             # 头文件（数据结构声明 + 系统接口）
-│   ├── containers.h     #   Stack / Queue
-│   ├── hash_map.h       #   StringIntMap（链地址哈希表）
-│   ├── avl.h            #   AVL 平衡树
-│   ├── heap.h           #   BinaryHeap
-│   ├── inverted_index.h #   InvertedIndex（倒排索引）
-│   ├── friend_graph.h   #   FriendGraph（无向图 + BFS）
-│   ├── models.h         #   Member / Club / Activity / Application / Announcement
-│   └── system.h         #   ClubSystem（整合所有结构的核心类）
-├── src/
-│   ├── hash_map.cpp
-│   ├── avl.cpp
-│   ├── friend_graph.cpp
-│   ├── inverted_index.cpp
-│   ├── system.cpp       #   业务逻辑 + 撤销/重做 + 持久化
-│   ├── main.cpp         #   命令行入口
-│   ├── web_server.h     #   局域网 Web GUI 声明
-│   └── web_server.cpp   #   HTTP 服务器 + 内嵌前端 + REST 路由
-├── tests/
-│   └── test_main.cpp    #   201 条断言的单元测试
-├── examples/
-│   └── sample_data.txt  #   示例存档
-├── docs/
-│   └── terminal_output.md  # 演示输出
-├── Makefile
-├── README.md
-└── LICENSE
+```powershell
+.\run-wsl.ps1 -Action test       # 构建并执行核心、HTTP/CLI、权限测试
+.\run-wsl.ps1 -Action init       # 首次设置管理员，输入两次密码
+.\run-wsl.ps1                   # 启动服务，然后打开 http://127.0.0.1:8090/
 ```
 
----
+可用 `-Port 8091` 更改端口，`-Distro Ubuntu-24.04` 选择已安装发行版，`-Username admin` 指定初始化/重置账号名。`-Action build` 只构建，`-Action demo` 运行内置演示，`-Action reset` 用于停服后在本机重置密码。按 Ctrl+C 停服；运行目录是项目根，真实数据与账号不会放进构建目录。
 
-## 4. 编译与运行
+Linux 产物位于 WSL 用户的 `~/.cache/clubmanager/<项目路径哈希>/`，实际路径写入 `build/wsl-build-path.txt`；使用 Linux 文件系统可避免挂载盘时间戳偏差造成构建警告。若 Ubuntu 没装 `libssl-dev`，脚本通过 apt 校验下载官方 OpenSSL 包，解包到项目私有 `build/wsl-openssl/`；不运行安装脚本，不需要 sudo。首次准备依赖需要网络，之后使用本地 SDK；它不会随系统自动更新，需要定期重新准备或改用系统维护的开发包。没有 `g++`/CMake/Python 时，应先在 Ubuntu 安装 `build-essential cmake python3 libssl-dev`。WSL 的标准开发方式见 [微软文档](https://learn.microsoft.com/windows/wsl/setup/environment)。
 
-需要 **g++（支持 C++17）**，例如 MinGW-w64 / MSYS2。
+在 Ubuntu 终端中也可以运行 `bash scripts/run-linux.sh test`、`bash scripts/run-linux.sh init`、`bash scripts/run-linux.sh run`。
+
+依赖准备成功后，脚本自动删除一次性下载索引、软件包及不用的静态库。日常只保留一套 WSL 增量构建、必要动态依赖和源码。清理旧 Windows 构建与历史临时文件可运行 `./scripts/clean-build.ps1`，或先加 `-WhatIf` 查看清理范围；账号、业务数据和当前预览会保留。
+
+## 原生 Windows 构建（兼容入口）
+
+需要 MinGW-w64 的 `g++`（C++17）、PowerShell；运行接口测试另需 Python 3。把编译器加入 PATH。
+
+```powershell
+.\build.ps1                  # 编译，生成 build/club.exe
+.\build.ps1 -Test            # 编译并运行单元测试及真实 HTTP/CLI 测试
+.\build\club.exe demo        # 内置演示，不修改工作存档
+.\build\club.exe auth init admin  # 首次运行：按提示输入两次密码，无默认密码
+.\build\club.exe gui         # 浏览器界面，默认 http://127.0.0.1:8090
+```
+
+导入随项目提供的虚构示例（8 位成员、3 个社团/部门、2 场活动）：
+
+```powershell
+.\build\club.exe load examples/sample_data.txt
+.\build\club.exe gui
+```
+
+`load` 会将指定文件导入为当前工作存档；已有真实数据时，先用 `save backup.txt` 导出备份。服务器运行时，请使用网页操作这份数据；不要同时用另一个 CLI 进程修改同一个工作目录。
+
+原生 Windows 构建脚本已在中文路径中编译成功，但当前机器的智能应用控制阻止新 EXE 运行；最终运行与测试已转到 WSL。部分 MinGW Make 版本不能正确处理中文路径，原生 Windows 兼容构建使用上述脚本。
+
+## CMake 构建（Linux 或支持项目路径的工具链）
 
 ```bash
-make              # 生成 build/club.exe
-make demo         # 运行内置演示（一条命令展示全部功能）
-make test         # 运行 201 条断言的单元测试
-make gui          # 启动局域网多人共用 Web 图形界面(自动打开浏览器)
-make clean        # 清理构建产物与运行时存档 club_data.txt
+cmake -S . -B build -DCMAKE_BUILD_TYPE=Release
+cmake --build build -j
+ctest --test-dir build --output-on-failure
+./build/club demo
+./build/club gui
 ```
 
-也可手动编译：
+CMake 最低 3.16，编译器支持 C++17。Windows 使用系统 BCrypt；Linux/macOS 的密码学实现依赖 OpenSSL 开发库（如 Debian/Ubuntu 的 `libssl-dev`）。不依赖数据库或在线服务。检测到 Python 时，CTest 自动包含 HTTP/CLI 和权限测试。各平台实际验证状态见 [验证记录](docs/verification.md)。
 
-```bash
-g++ -std=c++17 -O2 -Wall -Wextra -Iinclude src/*.cpp -o club
-./club demo
-```
+## 使用与规则
 
-> Windows 下命令行参数与中文编码已通过 `CommandLineToArgvW` + UTF-8 转换处理。
+首次在本机通过 `auth init admin` 设置管理员，启动后用该账号登录。在“成员”页添加在册成员，再在“账号权限”页创建普通成员账号并绑定成员。系统不提供公开注册，也没有默认密码。
 
----
+管理员可以管理成员、社团、活动、审批、好友、排行、公告、数据和账号；顶栏选择的是管理员**代操作的成员**。普通成员的身份由登录账号固定，页面只有我的日程、活动报名、社团入社、我的申请、我的公告；不能修改积分或标签、审批、直接入社、调整容量、导入导出、撤销全局操作或管理账号。双方均可修改自己的密码和退出登录。
 
-## 5. 命令行用法
+成员/活动管理页支持表内搜索；活动名单支持查看与 CSV 下载；成员页可展开批量导入。权限由服务端检查，隐藏按钮不是权限边界。详细流程、接口和角色矩阵见 [登录与权限说明](docs/authentication.md)。
 
-命令默认操作一个自动持久化的工作存档 `club_data.txt`（首次运行自动创建，
-之后每次调用自动载入 / 保存），因此多条命令之间状态连续。
+- 报名必须具备全部所需标签；无所需标签则公开报名，不要求先加入主办社团。
+- 时间使用 `day=0..6`（周日到周六），分钟范围 `[0,1440]`，要求开始时间小于结束时间。未设置结构化时间的活动仅展示文本，不检测冲突。
+- 冲突判断使用半开区间 `[start,end)`，前一场结束后立即开始下一场不算冲突。
+- 正取活动占用时间；候补不占用时间。报名和候补转正都会检查与现有正取活动的冲突。暂不合格者保留候补，在下次补位时重新检查。
+- 候补按**当前积分降序，同分成员 ID 升序**提拔。缩容保留已签到者，其余正取按当前积分择优保留；不能缩到已签到人数以下。
+- 签到奖励固定 10 分；重复签到、候补签到、结束后签到都会被拒绝。已签到者不能取消报名。撤销签到会同时撤销积分。
+- 结束活动后停止报名、取消、签到和容量修改，并释放时间冲突占用；候补名单也作为历史保留。结束可以撤销。
+- “查看下一条待审”只查看，不会丢失申请；通过、拒绝或撤回才让申请离开待审队列。
+- 删除成员前必须先处理其在册社团、活动参与和待审申请；删除社团前必须清理其成员、子部门、活动和待审申请。删除可撤销。
+- 撤销/重做历史仅在当前进程内有效；网页是持续会话，单次 CLI 调用不是。载入成功会重置操作历史。
+- 活跃度不低于零；加减积分使用宽整数计算并限制在 `int` 范围内。成员排行榜沿用原实现的 `(score,id)` 降序，同分 ID 较大者在前；CLI 排名从 0 开始，网页显示从 1 开始。
+
+常用新命令：
 
 ```text
-用法: club <命令> [参数...]
-
-  成员:   member add <姓名> <年级> [tag:标签...]
-          member remove <id> | member score <id> <增减>
-          member tag <id> <标签> | member untag <id> <标签>
-          member tags <id>            # 查看成员标签
-          member bytag <标签>         # 单词查询（倒排索引）
-          member bytags all|any <t1> <t2>...   # 多标签 AND / OR
-          member alltags              # 列出全部标签
-          member import <文件>         # CSV 批量导入(姓名,年级,标签1;标签2)
-          member list | member find <姓名>
-  社团:   club create <名称> <分类> <成立> <简介>
-          club sub <父id> <名称> <分类> <成立> <简介>   # 子部门
-          club org                    # 组织架构(DFS)
-          club remove <id> | club join <clubId> <memberId>
-          club leave <clubId> <memberId> | club list
-  活动:   activity add <clubId> <名称> <时间> <容量>
-          activity addtimed <clubId> <名称> <容量> <日> <起> <止> [tag:标签...]
-          activity remove <id>
-          activity signup <memberId> <actId>     # 满员进候补；时间冲突则拒绝
-          activity cancel <memberId> <actId>
-          activity cap <actId> <新容量>          # 缩容降级 / 扩容提拔
-          activity list | activity waitlist <actId>
-  审批:   app submit <memberId> <clubId> [优先级]
-          app process                    # 处理优先级最高者
-          app review <appId> <approve|reject> | app pending
-  好友:   friend add <a> <b> | friend remove <a> <b>
-          friend recommend <id>          # 二度人脉推荐
-          friend distance <a> <b>        # 最短关系距离
-          friend path <a> <b>            # 最短社交路径(含端点)
-          friend recact <id>             # 好友驱动活动推荐
-  排行:   rank leaderboard [k] | rank member <id> | rank range <lo> <hi>
-          rank clubleader [k]            # 社团活跃度排行
-  公告:   announce broadcast <clubId> <senderId> <消息...>
-          announce club <clubId>         # 某社团公告
-          announce mine <memberId>       # 我能收到的公告
-  其他:   undo | redo | save <path> | load <path> | demo | help
+club stats
+club schedule <memberId>
+club activity checkin <memberId> <actId>
+club activity close <actId>
+club app withdraw <appId> <memberId>
+club export members <path.csv>
+club export roster <actId> <path.csv>
+club save <backup.txt>
+club load <backup.txt>
+club help
 ```
 
-### 示例：载入示例存档并查询
+完整的原有命令见 `club help`。例如：
 
-```bash
-./build/club.exe load examples/sample_data.txt   # 导入示例存档
-./build/club.exe member list                     # 列出成员
-./build/club.exe rank leaderboard 3              # Top-3 活跃度
-./build/club.exe member bytag Python             # 查会 Python 的成员
-./build/club.exe member bytags all Python 算法    # 同时会 Python 与算法
-./build/club.exe club org                        # 组织架构
-./build/club.exe activity waitlist 0             # 活动候补名单
-./build/club.exe app pending                     # 待审申请数
-./build/club.exe friend path 0 3                 # 最短社交路径
+```powershell
+.\build\club.exe member add Alice 2026 tag:Python
+.\build\club.exe club create 编程社 技术 2026-10 学习交流
+.\build\club.exe activity addtimed 0 编程交流 20 6 840 960 tag:Python
+.\build\club.exe activity signup 0 0
+.\build\club.exe activity checkin 0 0
+.\build\club.exe schedule 0
+.\build\club.exe export roster 0 roster.csv
 ```
 
-> **提示**：`undo` / `redo` 作用于**当前会话内**的操作历史。撤销 / 重做栈保存在内存中，
-> 跨进程调用不延续（闭包无法序列化，这是命令模式撤销的固有特性）。单次会话中连续操作
-> （如 `demo`）时撤销 / 重做可完整工作；跨 CLI 调用时历史会重置。
+上述 ID 示例假设从空工作目录开始运行。
 
-### 图形界面（多人共用 Web GUI）
+## 导入与存档
 
-不想敲命令时，运行 `club gui` 会启动一个**本地 Web 服务器**，浏览器打开
-`http://127.0.0.1:8090` 即进入图形界面。把地址换成**运行机器的局域网 IP**，
-同一局域网内的同事就能在各自浏览器里访问**同一份数据**、实时协作修改。
+CSV 使用 UTF-8，支持 BOM、CRLF、可选表头、带引号的逗号和双引号字段：
 
-- **多人共用**：服务器持有唯一一份内存数据，所有人的操作即时作用于这份数据，
-  并自动写入 `club_data.txt`（无需手动保存），一人改、其他人刷新即见。
-- **简单身份选择**：顶栏下拉选择"我是谁"（成员），报名 / 取消 / 以本人身份发公告
-  等操作即作用于该成员；无密码与角色，适合团队内部可信协作。
-- **功能覆盖**：成员 / 社团 / 活动 / 审批 / 好友 / 排行 / 公告七个标签页，
-  覆盖命令行全部功能，每个操作都有 toast 反馈；顶栏可撤销 / 重做 / 保存。
-- **首次放行端口**：Windows 首次运行会弹窗请求放行 8090 端口（也可手动以管理员运行
-  `netsh advfirewall firewall add rule name=ClubManager dir=in action=allow protocol=TCP localport=8090`）；
-  放行后局域网内其他机器才能访问。
-- **跨平台**：Windows 用 Winsock、Linux 用 POSIX sockets（`#ifdef _WIN32` 隔离），
-  便于后续部署到云服务器（如 Oracle Cloud 常开免费层）对外公开访问。
+```csv
+姓名,年级,标签
+张三,2026,Python;算法
+"Doe, Jane",2025,C++
+```
 
----
+导入返回新增、重名跳过、格式错误三项统计，整批可撤销。只导入姓名、年级、标签；导出的 ID/积分列是报告字段，不会用导入篡改积分。CSV 不支持跨行字段；导出会对可能被表格软件识别为公式的用户文本加前导单引号。
 
-## 6. 持久化格式
+默认存档是**运行工作目录**中的 `club_data.txt`，不会自动上传。格式 v3 仍为可读文本，`|` 分字段、`;` 分标签，使用百分号编码保存分隔符、换行及控制字符；包含签到名单、活动结束状态、成员稳定绑定标识。v1 示例和 v2 存档仍可加载，下一次保存会写成 v3。
 
-存档为纯文本，`|` 分隔字段、空行分段，便于查看与调试：
+账号和加盐密码哈希单独保存为 `club_accounts.txt`，不会出现在业务 JSON 或 CSV 导出中。备份时同时保存这两个文件；`save` 命令只导出业务数据。导入另一份数据或旧格式时，编号相同不代表同一个人：原成员绑定失效的账号会被拒绝登录，管理员核实身份后可重新绑定。账号权限变更不进入业务撤销栈。
+
+读取在临时对象中完成：检查头部、字段数量、数字、ID、引用关系、容量、时间、组织环路及正式报名冲突，全部通过才替换当前状态。失败时当前数据和撤销历史保持不变。保存先写入同目录临时文件，确认写入成功后替换目标文件；失败清理临时文件并报告错误。它不是数据库事务，不提供跨进程写入协调或停电级备份。
+
+## 数据结构与设计
+
+| 模块 | 关键实现与作用 | 复杂度与取舍 |
+|---|---|---|
+| 姓名索引 | `hash_map.cpp`，链地址哈希表 | 查找平均 O(1)，最坏 O(n) |
+| 活跃度索引 | `avl.cpp`，带子树计数的 AVL | 更新/排名 O(log n)，Top-K O(log n+k)；区间计数为两次前缀计数 O(log n) |
+| 标签索引 | `inverted_index.cpp`，有序倒排列表 | 查询 AND/OR 使用归并；数组插入/删除最坏 O(n)，不是 O(log n) |
+| 候补与审批 | `heap.h`，二叉堆 | 入堆 O(log n)；为反映积分变化，转正扫描当前候补并重建堆，O(w log w)，另加资格检查成本 |
+| 关系网络 | `friend_graph.cpp`，无向邻接表与 BFS | 最短路径 O(V+E)，推荐按共同好友计数排序 |
+| 组织层级 | `system.cpp`，父子节点与 DFS | 遍历 O(C)，载入时检查环路 |
+| 撤销/重做 | 两个命令栈、操作前后快照 | 能恢复补位造成的全部变化；快照消耗与操作涉及的名单规模有关 |
+| 日程与统计 | `features.cpp` | 统计遍历实体与名单；个人日程筛选后按时间排序 |
+| 持久化 | `persistence.cpp`、`data_io.cpp` | 临时对象校验、索引重建、临时文件替换 |
+
+关键哈希表、AVL、堆、倒排索引的逻辑在项目内实现。图的底层邻接容器和计数使用 `std::unordered_map` / `std::unordered_set`，BFS 使用 `std::queue`；Web 路由参数使用 `std::map`。`containers.h` 中另有教学用栈/循环队列，不能声称项目完全未使用 STL 容器。
+
+## 目录
 
 ```text
-# ClubManager save
-clock|10
-seq|m4|c1|a1|p1|n0
-members
-M|0|Alice|2022|20|1|1|Python;算法
-END
-clubs
-C|0|编程社|学术科技|2020-09|热爱编程|1|0 1|-1|1
-END
-activities
-A|0|0|算法周赛|周六19:00|2|1|0|2 3|Python;算法|5|1140|1200
-END
-applications
-P|0|2|0|5|0|0
-END
-announcements
-N|0|0|0|今晚周赛|6
-END
-friends
-F|0|1
-END
+include/              数据模型、数据结构与业务接口
+src/system.cpp        成员/社团/活动/审批及操作历史
+src/features.cpp      签到、日程、统计、CSV 导出
+src/persistence.cpp   存档编解码及载入校验
+src/data_io.cpp       CSV 与原子文件替换
+src/auth.cpp          加盐密码哈希、账号持久化、会话与登录限速
+src/web_auth.inc      Web 认证入口、角色授权和本人数据范围
+src/main.cpp          命令行
+src/web_server.cpp    HTTP 服务、JSON 路由与内嵌中文页面
+build.ps1             Windows 构建与测试入口
+run-wsl.ps1           Windows 调用 WSL 的日常开发入口
+启动社团管理.cmd       双击启动，首次初始化管理员并自动打开网页
+停止社团管理.cmd       双击停止对应的正式服务
+scripts/launch.py     后台运行、重复启动保护与进程身份校验
+scripts/run-linux.sh  Linux 构建、测试、初始化和启动
+scripts/clean-build.ps1 清理本项目旧构建与临时缓存
+CMakeLists.txt        跨平台构建入口
+tests/                数据结构、业务回归与 HTTP/CLI 测试
+examples/             虚构示例数据
+docs/                 演示截图、验证与协作记录
 ```
 
-- 字段含义见 `src/system.cpp` 的 `save()` / `load()`。
-- 名单（社团成员、活动正取名额 / 候补）用空格分隔的 id 列表；标签用 `;` 分隔。
-- 成员行末段为标签，社团行末段为 `parentClub` 与子部门 id 列表，活动行包含正取名额、
-  候补、所需标签与结构化时间段（`day` / `startMin` / `endMin`）。
-- 读档时重建所有索引（哈希表、AVL、倒排索引、图、优先队列）。
+## 验证
 
----
+`run-wsl.ps1 -Action test` 会在 Linux 构建目录执行 C++ 单元测试，并在独立临时目录、随机本地端口启动真实 HTTP 与权限测试，不修改个人工作存档。当前 WSL 验证为 641 项核心检查、55 项 HTTP/CLI 检查和 197 项权限检查，合计 893 项通过。
 
-## 7. 测试
+验证覆盖正常流程和以下回归场景：报名/候补/取消的完整撤销与重做、候补转正的冲突复查、按积分缩容、资格标签、一次性签到积分、结束活动、撤回与审批、索引排除已删除成员、特殊字符存档、损坏文件不污染状态、CSV 引号与表头、错误 HTTP 参数、旧存档兼容及 CLI 导出。AVL 使用固定随机种子与简单数组实现对照验证排名、范围计数、Top-K 和删除。
 
-`make test` 运行 **201 条断言**，覆盖：
+实际结果与演示流程见 [验证记录](docs/verification.md)，代表性修复决策见 [AI 协作记录](docs/ai-collaboration.md)。
 
-- **哈希表**：增删查、更新、rehash 扩容。
-- **AVL**：插入触发旋转、同分不同 id、Top-K、排名、区间计数、中序有序、删除后平衡。
-- **二叉堆**：降序弹出、pair 比较。
-- **栈 / 队列**：栈 LIFO、队列 FIFO 与扩容、环绕。
-- **倒排索引**：加词、AND / OR 归并、删除、空表回收。
-- **图**：无向边、BFS 距离、二度推荐、**最短路径回溯**、删边。
-- **系统层**：成员查重、删除保护、活跃度排行、社团删除保护、组织架构 DFS、
-  候补入堆与提拔、**按当前活跃度重新择优**、**时间段冲突检测**、容量缩容 / 扩容、
-  申请优先级排序、审批通过 / 拒绝、打 / 删标签、**撤销 + 重做双栈**、公告广播、
-  好友驱动活动推荐、批量导入、**保存 / 载入往返一致性（含正取名额持久化）**。
+## 局域网与已知限制
 
-```text
-==================================
-ALL TESTS PASSED (201 checks)
+默认仅监听本机。如需可信局域网共用：
+
+```powershell
+$env:CLUB_LAN='1'
+$env:CLUB_PORT='8090'         # 可选
+.\build\club.exe gui
 ```
 
----
+必要时由运行者配置防火墙；程序不自动提权或修改防火墙。`CLUB_NO_BROWSER=1` 可关闭自动打开浏览器。
 
-## 8. 已知限制
+Web 已实现密码登录和服务端角色权限，默认监听本机。内置服务器使用 HTTP，没有 TLS；局域网正式传输密码时应放在配置正确的 HTTPS 反向代理后，并设置 `CLUB_SECURE_COOKIE=1`（代理须保留外部 Host）。该变量仅启用 Secure Cookie 和 HTTPS Origin 校验，不会自动提供 TLS。CLI 是服务器本机所有者的维护工具，不受 Web 成员角色限制；普通成员只应获得网页账号，不能获得服务器目录或命令行访问权。
 
-- 撤销 / 重做历史为会话内有效，不跨进程持久化（见上文提示）。
-- Web GUI 为**局域网多人共用**设计：数据由运行 `club gui` 的单一服务器持有并自动存档，
-  身份仅为下拉选择、无鉴权，适合可信局域网 / 团队内部协作，不应直接暴露到公网。
-- 存档字段以 `|` 分隔，名称 / 简介 / 公告等文本字段不应包含 `|`（CLI 层未做转义）。
-- 逻辑删除会在向量中留下空位（`active=false`），换取 `id==下标` 的 O(1) 访问；
-  这是空间换时间的有意取舍。
-- 时间段冲突检测仅在活动提供结构化 `day` / 起止时间时生效；纯文本时间（如"周六 19:00"）
-  不参与冲突判断。
+其他浏览器点击“刷新数据”可看到更新；当前没有 WebSocket 实时推送。时间是每周时段，没有真实日期、跨周周期或跨午夜活动。签到由用户手动触发，没有定位或签到时窗。撤销历史不限制条数；大数据场景尚需分页和持久化审计日志。Web 服务器为教学级实现，尚未做高并发压测或生产安全审计。
 
----
+## 来源与 AI 使用声明
 
-## 许可证
-
-MIT License，见 [LICENSE](LICENSE)。
+- 示例数据是虚构的社团和成员，用于演示与测试。
+- 本次使用 **OpenAI Codex** 辅助代码审查、功能设计、实现、回归测试、浏览器验证和文档整理；保留了原有数据结构和项目架构。
+- 本次未复制外部项目代码；使用 C++ 标准库、Windows/POSIX socket API 和 Python 标准库。密码学使用 Windows BCrypt 或 Linux OpenSSL；没有引入前端框架。
+- 本人承担的原始设计、修改与判断：**请项目作者根据实际贡献补充，提交前自行阅读并解释关键代码。** 这里不代替作者声明其未确认的工作。
+- 仓库已有 [MIT 许可证](LICENSE)，本次保留原许可证文件；原有源码来源未进一步核验。
+- 课程 PDF、姓名院系、GitHub 链接及最终提交版本需由作者确认后准备；项目改进不等同于已完成课程提交。

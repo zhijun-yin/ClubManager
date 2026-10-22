@@ -1,4 +1,5 @@
 #include "system.h"
+#include "data_io.h"
 
 #include <algorithm>
 #include <fstream>
@@ -6,6 +7,7 @@
 #include <string>
 #include <unordered_map>
 #include <cctype>
+#include <limits>
 
 namespace {
 
@@ -28,26 +30,6 @@ std::vector<std::string> splitStr(const std::string& s, char delim) {
     return out;
 }
 
-std::string joinInts(const std::vector<int>& v) {
-    std::ostringstream os;
-    for (size_t i = 0; i < v.size(); ++i) { if (i) os << ' '; os << v[i]; }
-    return os.str();
-}
-
-std::vector<int> parseInts(const std::string& s) {
-    std::vector<int> out;
-    std::istringstream is(s);
-    int x;
-    while (is >> x) out.push_back(x);
-    return out;
-}
-
-std::string joinStrs(const std::vector<std::string>& v) {
-    std::ostringstream os;
-    for (size_t i = 0; i < v.size(); ++i) { if (i) os << ';'; os << v[i]; }
-    return os.str();
-}
-
 std::vector<std::string> parseStrs(const std::string& s) {
     std::vector<std::string> out;
     for (auto& t : splitStr(s, ';')) { t = trim(t); if (!t.empty()) out.push_back(t); }
@@ -66,14 +48,15 @@ int ClubSystem::addMember(const std::string& name, const std::string& grade) {
 
 int ClubSystem::addMember(const std::string& name, const std::string& grade,
                           const std::vector<std::string>& tags) {
-    if (memberByName_.contains(name)) return -1;  // 重名
+    if (trim(name).empty() || memberByName_.contains(name)) return -1;
     Member m;
     m.id = nextMemberId_++;
     m.name = name;
     m.grade = grade;
     m.score = 0;
     m.joinSeq = nextSeq();
-    m.tags = tags;
+    for (const auto& tag : tags)
+        if (!trim(tag).empty() && std::find(m.tags.begin(), m.tags.end(), tag) == m.tags.end()) m.tags.push_back(tag);
     _addMemberInternal(m);
 
     Member snapshot = m;
@@ -85,7 +68,9 @@ int ClubSystem::addMember(const std::string& name, const std::string& grade,
 
 void ClubSystem::_addMemberInternal(const Member& m) {
     if (m.id >= static_cast<int>(members_.size())) members_.resize(m.id + 1);
+    auto binding = members_[m.id].accountKey;
     members_[m.id] = m;
+    if (members_[m.id].accountKey.empty()) members_[m.id].accountKey = binding;
     memberByName_.put(m.name, m.id);
     scoreIndex_.insert(m.score, m.id);
     _addTagToIndex(m);
@@ -112,10 +97,19 @@ bool ClubSystem::removeMember(int id) {
     for (const auto& app : applications_) {
         if (app.status == 0 && app.memberId == id) return false;
     }
+    for (const auto& club : clubs_) if (club.active && containsId(club.memberIds, id)) return false;
     Member snapshot = *m;
+    auto friends = friendGraph_.friendsOf(id);
+    for (int other : friends) friendGraph_.removeFriend(id, other);
     _removeMemberInternal(id);
-    pushCmd([this, snapshot]() { _addMemberInternal(snapshot); },
-            [this, id]() { _removeMemberInternal(id); });
+    pushCmd([this, snapshot, friends]() {
+                _addMemberInternal(snapshot);
+                for (int other : friends) friendGraph_.addFriend(snapshot.id, other);
+            },
+            [this, id, friends]() {
+                for (int other : friends) friendGraph_.removeFriend(id, other);
+                _removeMemberInternal(id);
+            });
     return true;
 }
 
@@ -123,7 +117,8 @@ void ClubSystem::addScore(int id, int delta) {
     Member* m = findMember(id);
     if (!m) return;
     int oldScore = m->score;
-    int newScore = std::max(0, oldScore + delta);
+    int newScore = static_cast<int>(std::clamp(static_cast<long long>(oldScore) + delta,
+                                               0LL, static_cast<long long>(std::numeric_limits<int>::max())));
     if (newScore == oldScore) return;
     _setScoreInternal(id, newScore);
     pushCmd([this, id, oldScore]() { _setScoreInternal(id, oldScore); },
@@ -140,7 +135,7 @@ void ClubSystem::_setScoreInternal(int id, int score) {
 
 bool ClubSystem::addMemberTag(int id, const std::string& tag) {
     Member* m = findMember(id);
-    if (!m || tag.empty()) return false;
+    if (!m || trim(tag).empty()) return false;
     for (auto& t : m->tags) if (t == tag) return false;
     _addTagInternal(id, tag);
     pushCmd([this, id, tag]() { _removeTagInternal(id, tag); },
@@ -212,7 +207,7 @@ std::vector<std::string> ClubSystem::allTags() const {
 
 int ClubSystem::createClub(const std::string& name, const std::string& category,
                            const std::string& founded, const std::string& description) {
-    if (clubByName_.contains(name)) return -1;
+    if (trim(name).empty() || clubByName_.contains(name)) return -1;
     Club c;
     c.id = nextClubId_++;
     c.name = name; c.category = category; c.founded = founded; c.description = description;
@@ -228,7 +223,7 @@ int ClubSystem::createSubClub(int parentId, const std::string& name,
                               const std::string& category, const std::string& founded,
                               const std::string& description) {
     if (!findClub(parentId)) return -1;  // 父不存在
-    if (clubByName_.contains(name)) return -1;
+    if (trim(name).empty() || clubByName_.contains(name)) return -1;
     Club c;
     c.id = nextClubId_++;
     c.name = name; c.category = category; c.founded = founded; c.description = description;
@@ -274,6 +269,8 @@ bool ClubSystem::removeClub(int id) {
     if (!c) return false;
     for (int mid : c->memberIds) if (findMember(mid)) return false;
     for (int sub : c->subClubs) if (findClub(sub)) return false;
+    for (const auto& a : activities_) if (a.active && a.clubId == id) return false;
+    for (const auto& a : applications_) if (a.status == 0 && a.clubId == id) return false;
     Club snapshot = *c;
     int pid = c->parentClub;
     _removeClubInternal(id);
@@ -313,7 +310,11 @@ bool ClubSystem::joinClub(int clubId, int memberId) {
     Member* m = findMember(memberId);
     if (!c || !m) return false;
     if (containsId(c->memberIds, memberId)) return false;
+    auto before = c->memberIds;
     c->memberIds.push_back(memberId);
+    auto after = c->memberIds;
+    pushCmd([this, clubId, before]() { clubs_[clubId].memberIds = before; },
+            [this, clubId, after]() { clubs_[clubId].memberIds = after; });
     return true;
 }
 bool ClubSystem::leaveClub(int clubId, int memberId) {
@@ -322,7 +323,11 @@ bool ClubSystem::leaveClub(int clubId, int memberId) {
     auto& v = c->memberIds;
     auto it = std::find(v.begin(), v.end(), memberId);
     if (it == v.end()) return false;
+    auto before = v;
     v.erase(it);
+    auto after = v;
+    pushCmd([this, clubId, before]() { clubs_[clubId].memberIds = before; },
+            [this, clubId, after]() { clubs_[clubId].memberIds = after; });
     return true;
 }
 
@@ -352,8 +357,9 @@ int ClubSystem::addActivity(int clubId, const std::string& name, const std::stri
                             int capacity, const std::vector<std::string>& requiredTags,
                             int day, int startMin, int endMin) {
     Club* c = findClub(clubId);
-    if (!c) return -1;
-    if (capacity < 0) capacity = 0;
+    if (!c || trim(name).empty() || activityByName_.contains(name) || capacity < 0) return -1;
+    bool untimed = day == -1 && startMin == -1 && endMin == -1;
+    if (!untimed && (day < 0 || day > 6 || startMin < 0 || startMin >= endMin || endMin > 1440)) return -1;
     Activity a;
     a.id = nextActivityId_++;
     a.clubId = clubId; a.name = name; a.time = time; a.capacity = capacity;
@@ -413,8 +419,7 @@ void ClubSystem::_restoreSignup(int activityId, const std::vector<int>& signedUp
 
 bool ClubSystem::setActivityCapacity(int activityId, int newCapacity) {
     Activity* a = findActivity(activityId);
-    if (!a) return false;
-    if (newCapacity < 0) newCapacity = 0;
+    if (!a || a->closed || newCapacity < 0 || newCapacity < static_cast<int>(a->checkedIn.size())) return false;
     if (newCapacity == a->capacity) return false;
 
     std::vector<int> oldSigned = a->signedUp;
@@ -423,10 +428,16 @@ bool ClubSystem::setActivityCapacity(int activityId, int newCapacity) {
 
     if (newCapacity < oldCap) {
         // 缩容：正取名额中超出容量的部分（按活跃度最低者）降级到候补
-        std::vector<int> keep(oldSigned.begin(),
-                              oldSigned.begin() + std::min(newCapacity, (int)oldSigned.size()));
-        std::vector<int> overflow(oldSigned.begin() + std::min(newCapacity, (int)oldSigned.size()),
-                                  oldSigned.end());
+        auto ranked = oldSigned;
+        std::sort(ranked.begin(), ranked.end(), [&](int x, int y) {
+            bool cx = containsId(a->checkedIn, x), cy = containsId(a->checkedIn, y);
+            if (cx != cy) return cx;
+            if (members_[x].score != members_[y].score) return members_[x].score > members_[y].score;
+            return x < y;
+        });
+        ranked.resize(std::min(newCapacity, static_cast<int>(ranked.size())));
+        std::vector<int> keep, overflow;
+        for (int mid : oldSigned) (containsId(ranked, mid) ? keep : overflow).push_back(mid);
         a->signedUp = keep;
         a->capacity = newCapacity;
         for (int mid : overflow) {
@@ -435,7 +446,8 @@ bool ClubSystem::setActivityCapacity(int activityId, int newCapacity) {
     } else {
         // 扩容：从候补按活跃度提拔
         a->capacity = newCapacity;
-        while ((int)a->signedUp.size() < newCapacity && !a->waitlist.empty()) _promoteFromWaitlist(activityId);
+        while ((int)a->signedUp.size() < newCapacity && !a->waitlist.empty())
+            if (_promoteFromWaitlist(activityId) < 0) break;
     }
 
     std::vector<int> newSigned = a->signedUp;
@@ -456,13 +468,16 @@ int ClubSystem::_promoteFromWaitlist(int activityId) {
     int best = -1;
     for (size_t i = 0; i < all.size(); ++i) {
         const Member* m = findMember(all[i].second);
-        if (!m) continue;  // 成员已删除，跳过
+        if (!m || _hasTimeConflict(m->id, activityId) || !_hasRequiredTags(m->id, *a)) continue;
         if (best < 0) { best = (int)i; continue; }
         const Member* mb = findMember(all[best].second);
         if (m->score > mb->score || (m->score == mb->score && all[i].second < all[best].second))
             best = (int)i;
     }
-    if (best < 0) return -1;
+    if (best < 0) {
+        for (const auto& p : all) if (findMember(p.second)) a->waitlist.push(p);
+        return -1;
+    }
     int promoted = all[best].second;
     a->signedUp.push_back(promoted);
     for (size_t i = 0; i < all.size(); ++i)
@@ -475,7 +490,7 @@ bool ClubSystem::_hasTimeConflict(int memberId, int activityId) const {
                             ? &activities_[activityId] : nullptr;
     if (!a || !a->timed()) return false;
     for (const auto& act : activities_) {
-        if (!act.active || !act.timed()) continue;
+        if (!act.active || act.closed || !act.timed()) continue;
         if (act.id == activityId) continue;
         if (act.day != a->day) continue;
         if (!containsId(act.signedUp, memberId)) continue;
@@ -489,22 +504,21 @@ std::string ClubSystem::signup(int memberId, int activityId) {
     Member* m = findMember(memberId);
     Activity* a = findActivity(activityId);
     if (!m || !a) return "失败：成员或活动不存在";
+    if (a->closed) return "失败：活动已结束";
+    if (!_hasRequiredTags(memberId, *a)) return "失败：缺少活动所需标签";
     if (containsId(a->signedUp, memberId)) return "失败：已报名";
     for (auto& p : a->waitlist.snapshot()) if (p.second == memberId) return "失败：已在候补";
 
-    if (static_cast<int>(a->signedUp.size()) < a->capacity) {
-        if (_hasTimeConflict(memberId, activityId)) return "失败：与该成员已报名活动的时间冲突";
+    if (_hasTimeConflict(memberId, activityId)) return "失败：与该成员已报名活动的时间冲突";
+    Activity before = *a;
+    bool waiting = static_cast<int>(a->signedUp.size()) >= a->capacity;
+    if (!waiting) {
         a->signedUp.push_back(memberId);
-        int aid = activityId;
-        pushCmd([this, memberId, aid]() { _cancelSignupInternal(memberId, aid); },
-                [this, memberId, aid]() {
-                    Activity* aa = findActivity(aid);
-                    if (aa && !containsId(aa->signedUp, memberId)) aa->signedUp.push_back(memberId);
-                });
-        return "成功：已报名";
-    }
-    a->waitlist.push({m->score, memberId});
-    return "成功：活动已满，已加入候补（按活跃度优先）";
+    } else a->waitlist.push({m->score, memberId});
+    Activity after = *a;
+    pushCmd([this, activityId, before]() { activities_[activityId] = before; },
+            [this, activityId, after]() { activities_[activityId] = after; });
+    return waiting ? "成功：活动已满，已加入候补（按活跃度优先）" : "成功：已报名";
 }
 
 bool ClubSystem::_cancelSignupInternal(int memberId, int activityId) {
@@ -526,20 +540,17 @@ bool ClubSystem::_cancelSignupInternal(int memberId, int activityId) {
 
 bool ClubSystem::cancelSignup(int memberId, int activityId) {
     Activity* a = findActivity(activityId);
-    if (!a) return false;
+    if (!a || a->closed || containsId(a->checkedIn, memberId)) return false;
     bool inSigned = containsId(a->signedUp, memberId);
     bool inWait = false;
     for (auto& p : a->waitlist.snapshot()) if (p.second == memberId) { inWait = true; break; }
     if (!inSigned && !inWait) return false;
+    Activity before = *a;
     bool ok = _cancelSignupInternal(memberId, activityId);
     if (ok) {
-        pushCmd(
-            [this, memberId, activityId]() {
-                Activity* aa = findActivity(activityId);
-                Member* mm = findMember(memberId);
-                if (aa && mm) aa->waitlist.push({mm->score, memberId});
-            },
-            [this, memberId, activityId]() { _cancelSignupInternal(memberId, activityId); });
+        Activity after = *a;
+        pushCmd([this, activityId, before]() { activities_[activityId] = before; },
+                [this, activityId, after]() { activities_[activityId] = after; });
     }
     return ok;
 }
@@ -550,6 +561,10 @@ std::vector<int> ClubSystem::activityWaitlistIds(int activityId) const {
                             ? &activities_[activityId] : nullptr;
     if (!a) return ids;
     for (auto& p : a->waitlist.snapshot()) ids.push_back(p.second);
+    std::sort(ids.begin(), ids.end(), [this](int x, int y) {
+        if (members_[x].score != members_[y].score) return members_[x].score > members_[y].score;
+        return x < y;
+    });
     return ids;
 }
 void ClubSystem::setActivityWaitlist(int activityId, const std::vector<int>& ids) {
@@ -566,7 +581,9 @@ void ClubSystem::setActivityWaitlist(int activityId, const std::vector<int>& ids
 int ClubSystem::submitApplication(int memberId, int clubId, int priority) {
     Member* m = findMember(memberId);
     Club* c = findClub(clubId);
-    if (!m || !c) return -1;
+    if (!m || !c || containsId(c->memberIds, memberId)) return -1;
+    for (const auto& p : applications_)
+        if (p.status == 0 && p.memberId == memberId && p.clubId == clubId) return -1;
     Application app;
     app.id = nextAppId_++;
     app.memberId = memberId; app.clubId = clubId;
@@ -595,14 +612,7 @@ void ClubSystem::_rebuildPendingQueue() {
 }
 
 int ClubSystem::processNextApplication() {
-    while (!pendingApps_.empty()) {
-        PendingApp top = pendingApps_.top();
-        pendingApps_.pop();
-        Application* app = nullptr;
-        for (auto& a : applications_) if (a.id == top.appId) { app = &a; break; }
-        if (app && app->status == 0) return top.appId;
-    }
-    return -1;
+    return pendingApps_.empty() ? -1 : pendingApps_.top().appId;
 }
 
 bool ClubSystem::reviewApplication(int appId, bool approve) {
@@ -610,18 +620,22 @@ bool ClubSystem::reviewApplication(int appId, bool approve) {
     for (auto& a : applications_) if (a.id == appId) { app = &a; break; }
     if (!app || app->status != 0) return false;
     int memberId = app->memberId, clubId = app->clubId;
-    if (approve) joinClub(clubId, memberId);
+    Club* club = findClub(clubId);
+    if (!club || !findMember(memberId)) return false;
+    auto before = club->memberIds;
+    if (approve && !containsId(club->memberIds, memberId)) club->memberIds.push_back(memberId);
+    auto after = club->memberIds;
     app->status = approve ? 1 : -1;
     _rebuildPendingQueue();
 
     pushCmd(
-        [this, appId, memberId, clubId, approve]() {
-            if (approve) leaveClub(clubId, memberId);
+        [this, appId, clubId, before]() {
+            clubs_[clubId].memberIds = before;
             for (auto& a : applications_) if (a.id == appId) { a.status = 0; break; }
             _rebuildPendingQueue();
         },
-        [this, appId, memberId, clubId, approve]() {
-            if (approve) joinClub(clubId, memberId);
+        [this, appId, clubId, approve, after]() {
+            clubs_[clubId].memberIds = after;
             for (auto& a : applications_) if (a.id == appId) { a.status = approve ? 1 : -1; break; }
             _rebuildPendingQueue();
         });
@@ -635,6 +649,7 @@ int ClubSystem::pendingCount() const {
 // ==================== 好友关系（图 + BFS）====================
 
 void ClubSystem::addFriend(int a, int b) {
+    if (a == b || !findMember(a) || !findMember(b)) return;
     bool before = friendGraph_.areFriends(a, b);
     friendGraph_.addFriend(a, b);
     if (!before) {
@@ -654,13 +669,16 @@ std::vector<FriendGraph::Recommendation> ClubSystem::recommendFriends(int id) co
     return friendGraph_.recommend(id);
 }
 int ClubSystem::friendDistance(int a, int b) const {
+    if (!findMember(a) || !findMember(b)) return -1;
     return friendGraph_.friendDistance(a, b);
 }
 std::vector<int> ClubSystem::friendPath(int a, int b) const {
+    if (!findMember(a) || !findMember(b)) return {};
     return friendGraph_.path(a, b);
 }
 
 std::vector<std::pair<int, int>> ClubSystem::recommendActivities(int id) const {
+    if (!findMember(id)) return {};
     std::unordered_map<int, int> cnt;
     for (int f : friendGraph_.friendsOf(id)) {
         for (const auto& act : activities_) {
@@ -672,7 +690,9 @@ std::vector<std::pair<int, int>> ClubSystem::recommendActivities(int id) const {
                              [this, id](const std::pair<int, int>& p) {
                                  const Activity* a = (p.first >= 0 && p.first < (int)activities_.size())
                                                          ? &activities_[p.first] : nullptr;
-                                 return a && containsId(a->signedUp, id);
+                                 return !a || a->closed || containsId(a->signedUp, id) ||
+                                        containsId(activityWaitlistIds(a->id), id) ||
+                                        !_hasRequiredTags(id, *a) || _hasTimeConflict(id, a->id);
                              }),
               out.end());
     std::sort(out.begin(), out.end(), [](const std::pair<int, int>& x, const std::pair<int, int>& y) {
@@ -695,15 +715,15 @@ int ClubSystem::memberRank(int id) const {
 int ClubSystem::rangeActive(int lo, int hi) const {
     return scoreIndex_.rangeCount(lo, hi);
 }
-std::vector<std::pair<int, int>> ClubSystem::clubLeaderboard(size_t k) const {
-    std::vector<std::pair<int, int>> out;  // (总分, clubId)
+std::vector<std::pair<long long, int>> ClubSystem::clubLeaderboard(size_t k) const {
+    std::vector<std::pair<long long, int>> out;  // 总分可能超过单个成员的 int 范围
     for (const auto& c : clubs_) {
         if (!c.active) continue;
-        int total = 0;
+        long long total = 0;
         for (int mid : c.memberIds) { const Member* m = findMember(mid); if (m) total += m->score; }
         out.push_back({total, c.id});
     }
-    std::sort(out.begin(), out.end(), [](const std::pair<int, int>& a, const std::pair<int, int>& b) {
+    std::sort(out.begin(), out.end(), [](const std::pair<long long, int>& a, const std::pair<long long, int>& b) {
         if (a.first != b.first) return a.first > b.first;
         return a.second < b.second;
     });
@@ -716,7 +736,7 @@ std::vector<std::pair<int, int>> ClubSystem::clubLeaderboard(size_t k) const {
 int ClubSystem::broadcast(int clubId, int senderId, const std::string& message) {
     Club* c = findClub(clubId);
     Member* s = findMember(senderId);
-    if (!c || !s) return -1;
+    if (!c || !s || trim(message).empty()) return -1;
     Announcement an;
     an.id = nextAnnouncementId_++;
     an.clubId = clubId; an.senderId = senderId; an.message = message; an.seq = nextSeq();
@@ -774,10 +794,17 @@ ClubSystem::ImportResult ClubSystem::importMembers(const std::string& csv) {
     std::vector<Member> added;
     std::istringstream ss(csv);
     std::string line;
+    bool first = true;
     while (std::getline(ss, line)) {
+        if (first && line.rfind("\xEF\xBB\xBF", 0) == 0) line.erase(0, 3);
+        first = false;
+        if (!line.empty() && line.back() == '\r') line.pop_back();
         if (trim(line).empty()) continue;
-        std::vector<std::string> parts = splitStr(line, ',');
-        if (parts.size() < 2) { r.skippedInvalid++; continue; }
+        std::vector<std::string> parts;
+        if (!club_io::parseCsvRow(line, parts) || (parts.size() != 2 && parts.size() != 3 && parts.size() != 5)) {
+            r.skippedInvalid++; continue;
+        }
+        if ((parts[0] == "姓名" && parts[1] == "年级") || (parts[0] == "name" && parts[1] == "grade")) continue;
         std::string name = trim(parts[0]), grade = trim(parts[1]);
         if (name.empty()) { r.skippedInvalid++; continue; }
         std::vector<std::string> tags;
@@ -796,172 +823,4 @@ ClubSystem::ImportResult ClubSystem::importMembers(const std::string& csv) {
             [this, added]() { for (auto& m : added) _addMemberInternal(m); });
     }
     return r;
-}
-
-// ==================== 持久化 ====================
-
-bool ClubSystem::save(const std::string& path) const {
-    std::ofstream out(path);
-    if (!out) return false;
-
-    out << "# ClubManager save\n";
-    out << "clock|" << clock_ << "\n";
-    out << "seq|m" << nextMemberId_ << "|c" << nextClubId_
-        << "|a" << nextActivityId_ << "|p" << nextAppId_ << "|n" << nextAnnouncementId_ << "\n";
-
-    // 成员
-    out << "members\n";
-    for (const auto& m : members_) {
-        out << "M|" << m.id << "|" << m.name << "|" << m.grade << "|" << m.score << "|"
-            << m.joinSeq << "|" << (m.active ? 1 : 0) << "|" << joinStrs(m.tags) << "\n";
-    }
-    out << "END\n";
-
-    // 社团
-    out << "clubs\n";
-    for (const auto& c : clubs_) {
-        out << "C|" << c.id << "|" << c.name << "|" << c.category << "|" << c.founded << "|"
-            << c.description << "|" << (c.active ? 1 : 0) << "|" << joinInts(c.memberIds)
-            << "|" << c.parentClub << "|" << joinInts(c.subClubs) << "\n";
-    }
-    out << "END\n";
-
-    // 活动
-    out << "activities\n";
-    for (const auto& a : activities_) {
-        out << "A|" << a.id << "|" << a.clubId << "|" << a.name << "|" << a.time << "|"
-            << a.capacity << "|" << (a.active ? 1 : 0) << "|" << joinInts(a.signedUp)
-            << "|" << joinInts(activityWaitlistIds(a.id))
-            << "|" << joinStrs(a.requiredTags) << "|" << a.day << "|" << a.startMin
-            << "|" << a.endMin << "\n";
-    }
-    out << "END\n";
-
-    // 申请
-    out << "applications\n";
-    for (const auto& ap : applications_) {
-        out << "P|" << ap.id << "|" << ap.memberId << "|" << ap.clubId << "|" << ap.submitSeq
-            << "|" << ap.status << "|" << ap.priority << "\n";
-    }
-    out << "END\n";
-
-    // 公告
-    out << "announcements\n";
-    for (const auto& an : announcements_) {
-        out << "N|" << an.id << "|" << an.clubId << "|" << an.senderId << "|"
-            << an.message << "|" << an.seq << "\n";
-    }
-    out << "END\n";
-
-    // 好友关系
-    out << "friends\n";
-    for (const auto& e : friendGraph_.edges()) out << "F|" << e.first << "|" << e.second << "\n";
-    out << "END\n";
-
-    return out.good();
-}
-
-bool ClubSystem::load(const std::string& path) {
-    std::ifstream in(path);
-    if (!in) return false;
-
-    members_.clear(); clubs_.clear(); activities_.clear(); applications_.clear();
-    announcements_.clear(); undoStack_.clear(); redoStack_.clear();
-    memberByName_.clear(); clubByName_.clear(); activityByName_.clear();
-    scoreIndex_.clear(); friendGraph_.clear(); tagIndex_.clear();
-
-    std::string line;
-    int section = 0;  // 0 meta, 1 members, 2 clubs, 3 activities, 4 applications,
-                      // 5 announcements, 6 friends
-    while (std::getline(in, line)) {
-        if (line.empty() || line[0] == '#') continue;
-        if (line == "members") { section = 1; continue; }
-        if (line == "clubs") { section = 2; continue; }
-        if (line == "activities") { section = 3; continue; }
-        if (line == "applications") { section = 4; continue; }
-        if (line == "announcements") { section = 5; continue; }
-        if (line == "friends") { section = 6; continue; }
-        if (line == "END") { section = 0; continue; }
-
-        std::vector<std::string> f;
-        std::stringstream ls(line);
-        std::string cell;
-        while (std::getline(ls, cell, '|')) f.push_back(cell);
-        if (f.empty()) continue;
-
-        if (section == 0 && f[0] == "clock") {
-            clock_ = std::stoll(f[1]);
-        } else if (section == 0 && f[0] == "seq") {
-            nextMemberId_ = std::stoi(f[1].substr(1));
-            nextClubId_ = std::stoi(f[2].substr(1));
-            nextActivityId_ = std::stoi(f[3].substr(1));
-            nextAppId_ = std::stoi(f[4].substr(1));
-            nextAnnouncementId_ = (f.size() > 5) ? std::stoi(f[5].substr(1)) : 0;
-        } else if (section == 1 && f[0] == "M") {
-            Member m;
-            m.id = std::stoi(f[1]);
-            m.name = f[2]; m.grade = f[3];
-            m.score = std::stoi(f[4]);
-            m.joinSeq = std::stoll(f[5]);
-            m.active = (f[6] == "1");
-            if (f.size() > 7) m.tags = parseStrs(f[7]);
-            if (m.id >= (int)members_.size()) members_.resize(m.id + 1);
-            members_[m.id] = m;
-            memberByName_.put(m.name, m.id);
-            scoreIndex_.insert(m.score, m.id);
-        } else if (section == 2 && f[0] == "C") {
-            Club c;
-            c.id = std::stoi(f[1]);
-            c.name = f[2]; c.category = f[3]; c.founded = f[4]; c.description = f[5];
-            c.active = (f[6] == "1");
-            c.memberIds = (f.size() > 7) ? parseInts(f[7]) : std::vector<int>{};
-            c.parentClub = (f.size() > 8) ? std::stoi(f[8]) : -1;
-            c.subClubs = (f.size() > 9) ? parseInts(f[9]) : std::vector<int>{};
-            if (c.id >= (int)clubs_.size()) clubs_.resize(c.id + 1);
-            clubs_[c.id] = c;
-            clubByName_.put(c.name, c.id);
-        } else if (section == 3 && f[0] == "A") {
-            Activity a;
-            a.id = std::stoi(f[1]);
-            a.clubId = std::stoi(f[2]);
-            a.name = f[3]; a.time = f[4];
-            a.capacity = std::stoi(f[5]);
-            a.active = (f[6] == "1");
-            std::vector<int> signedIds = (f.size() > 7) ? parseInts(f[7]) : std::vector<int>{};
-            std::vector<int> wl = (f.size() > 8) ? parseInts(f[8]) : std::vector<int>{};
-            a.signedUp = signedIds;
-            if (f.size() > 9) a.requiredTags = parseStrs(f[9]);
-            if (f.size() > 12) { a.day = std::stoi(f[10]); a.startMin = std::stoi(f[11]); a.endMin = std::stoi(f[12]); }
-            if (a.id >= (int)activities_.size()) activities_.resize(a.id + 1);
-            activities_[a.id] = a;
-            activityByName_.put(a.name, a.id);
-            setActivityWaitlist(a.id, wl);
-        } else if (section == 4 && f[0] == "P") {
-            Application ap;
-            ap.id = std::stoi(f[1]);
-            ap.memberId = std::stoi(f[2]);
-            ap.clubId = std::stoi(f[3]);
-            ap.submitSeq = std::stoll(f[4]);
-            ap.status = std::stoi(f[5]);
-            ap.priority = (f.size() > 6) ? std::stoi(f[6]) : 0;
-            applications_.push_back(ap);
-        } else if (section == 5 && f[0] == "N") {
-            Announcement an;
-            an.id = std::stoi(f[1]);
-            an.clubId = std::stoi(f[2]);
-            an.senderId = std::stoi(f[3]);
-            an.message = f[4];
-            an.seq = std::stoll(f[5]);
-            announcements_.push_back(an);
-        } else if (section == 6 && f[0] == "F") {
-            friendGraph_.addFriend(std::stoi(f[1]), std::stoi(f[2]));
-        }
-    }
-
-    // 重建倒排索引（仅活跃成员）
-    for (const auto& m : members_) if (m.active) _addTagToIndex(m);
-    // 重建待审优先队列
-    _rebuildPendingQueue();
-
-    return true;
 }

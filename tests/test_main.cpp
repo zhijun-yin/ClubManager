@@ -11,6 +11,7 @@
 #include <string>
 #include <algorithm>
 #include <cassert>
+#include <cstdio>
 
 static int g_checks = 0;
 static int g_fail = 0;
@@ -300,9 +301,13 @@ static void testSystemApplications() {
     // processNextApplication 按提交顺序返回
     int first = sys.processNextApplication();
     CHECK(first == app1);
+    CHECK(sys.processNextApplication() == app1); // 查看不消费队列
+    CHECK(sys.pendingCount() == 2);
+    CHECK(sys.reviewApplication(app1, false));
     // 再处理第二个
     int second = sys.processNextApplication();
     CHECK(second == app2);
+    CHECK(sys.reviewApplication(app2, false));
     // 队列空
     CHECK(sys.processNextApplication() == -1);
     CHECK(sys.pendingCount() == 0);
@@ -368,7 +373,7 @@ static void testPersistence() {
     int app = sys.submitApplication(c, club);
     CHECK(app >= 0);
 
-    const char* path = "build/_test_save.txt";
+    const char* path = "_test_save.txt";
     CHECK(sys.save(path) == true);
 
     ClubSystem sys2;
@@ -403,6 +408,7 @@ static void testPersistence() {
 
     // 待审队列恢复（1 个 pending）
     CHECK(sys2.pendingCount() == 1);
+    std::remove(path);
 }
 
 // ---------------- 标签倒排索引 ----------------
@@ -461,6 +467,7 @@ static void testTimeConflict() {
     ClubSystem sys;
     int c = sys.createClub("社", "学术", "2020", "");
     int a = sys.addMember("Alice", "2022");
+    sys.addMemberTag(a, "x");  // 冲突测试先满足活动报名资格
     int t1 = sys.addActivity(c, "A", "", 5, {"x"}, 5, 18 * 60, 19 * 60);
     int t2 = sys.addActivity(c, "B", "", 5, {}, 5, 18 * 60 + 30, 19 * 60 + 30);  // 重叠
     int t3 = sys.addActivity(c, "C", "", 5, {}, 6, 10 * 60, 11 * 60);             // 不同天
@@ -495,10 +502,10 @@ static void testCapacityAdjust() {
     CHECK(sys.setActivityCapacity(act, 1) == true);
     auto& actRef = sys.activities()[act];
     CHECK(actRef.signedUp.size() == 1);
-    CHECK(actRef.signedUp[0] == a);
+    CHECK(actRef.signedUp[0] == b); // 当前积分最高者保留
     auto wl2 = sys.activityWaitlistIds(act);
     CHECK(wl2.size() == 3);
-    CHECK(std::find(wl2.begin(), wl2.end(), b) != wl2.end());
+    CHECK(std::find(wl2.begin(), wl2.end(), a) != wl2.end());
     CHECK(std::find(wl2.begin(), wl2.end(), cc) != wl2.end());
     CHECK(std::find(wl2.begin(), wl2.end(), d) != wl2.end());
 }
@@ -517,8 +524,11 @@ static void testPriorityApp() {
     CHECK(sys.pendingCount() == 3);
     // 队首 = 优先级最高者
     CHECK(sys.processNextApplication() == appHigh);
+    CHECK(sys.reviewApplication(appHigh, false));
     CHECK(sys.processNextApplication() == appMid);
+    CHECK(sys.reviewApplication(appMid, false));
     CHECK(sys.processNextApplication() == appLow);
+    CHECK(sys.reviewApplication(appLow, false));
     CHECK(sys.pendingCount() == 0);
 
     // 提交可撤销
@@ -650,7 +660,10 @@ static void testImport() {
     CHECK(sys.findMemberByName("王五") == -1);
 }
 
+#include "regression.h"
+
 int main() {
+    testRegressions();
     testHashMap();
     testAVL();
     testHeap();

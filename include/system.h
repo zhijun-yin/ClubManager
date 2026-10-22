@@ -30,6 +30,8 @@ inline bool operator<(const PendingApp& a, const PendingApp& b) {
 class ClubSystem {
 public:
     ClubSystem();
+    ClubSystem(const ClubSystem&) = delete;
+    ClubSystem& operator=(const ClubSystem&) = delete;
 
     // ---- 成员 ----
     int addMember(const std::string& name, const std::string& grade);
@@ -81,11 +83,23 @@ public:
     Activity* findActivity(int id);
     int findActivityByName(const std::string& name) const;
     const std::vector<Activity>& activities() const { return activities_; }
+    bool checkIn(int memberId, int activityId);
+    bool closeActivity(int activityId);
+    std::vector<int> memberSchedule(int memberId) const;
+    std::string exportMembersCsv() const;
+    std::string exportRosterCsv(int activityId) const;
+    struct Statistics {
+        int members = 0, clubs = 0, activities = 0, closedActivities = 0;
+        int registrations = 0, waiting = 0, checkIns = 0, pending = 0;
+        long long totalScore = 0;
+    };
+    Statistics statistics() const;
 
     // ---- 申请审批（优先级队列）----
     int submitApplication(int memberId, int clubId, int priority = 0);
-    int processNextApplication();                          // 取优先级最高者
+    int processNextApplication();                          // 查看优先级最高者，审批/撤回才出队
     bool reviewApplication(int appId, bool approve);
+    bool withdrawApplication(int appId, int memberId);
     const std::vector<Application>& applications() const { return applications_; }
     int pendingCount() const;
 
@@ -104,7 +118,7 @@ public:
     int memberRank(int id) const;
     int rangeActive(int lo, int hi) const;
     // 社团活跃度排行：按在册成员活跃度总和降序 (总分, clubId)
-    std::vector<std::pair<int, int>> clubLeaderboard(size_t k) const;
+    std::vector<std::pair<long long, int>> clubLeaderboard(size_t k) const;
 
     // ---- 公告广播 ----
     int broadcast(int clubId, int senderId, const std::string& message);
@@ -190,6 +204,7 @@ private:
     void _restoreSignup(int activityId, const std::vector<int>& signedUp,
                         const std::vector<int>& waitlistIds, int capacity);
     bool _hasTimeConflict(int memberId, int activityId) const;
+    bool _hasRequiredTags(int memberId, const Activity& activity) const;
     void _dfsOrg(int clubId, int depth, std::vector<std::string>& out) const;
 };
 

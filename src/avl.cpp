@@ -156,10 +156,19 @@ int AVL::rankOf(int score, int id) const {
 // ---- 区间计数：lo <= score <= hi ----
 
 int AVL::rangeCount(Node* node, int lo, int hi) const {
-    if (node == nullptr) return 0;
-    if (node->score < lo) return rangeCount(node->right, lo, hi);
-    if (node->score > hi) return rangeCount(node->left, lo, hi);
-    return rangeCount(node->left, lo, hi) + 1 + rangeCount(node->right, lo, hi);
+    if (lo > hi) return 0;
+    // 两次前缀计数，各只沿一条根到叶路径，避免遍历整个区间。
+    auto prefix = [](Node* p, int bound, bool inclusive) {
+        int count = 0;
+        while (p) {
+            if (p->score < bound || (inclusive && p->score == bound)) {
+                count += cnt(p->left) + 1;
+                p = p->right;
+            } else p = p->left;
+        }
+        return count;
+    };
+    return prefix(node, hi, true) - prefix(node, lo, false);
 }
 
 int AVL::rangeCount(int lo, int hi) const {

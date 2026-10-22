@@ -1,5 +1,7 @@
 #include "system.h"
 #include "web_server.h"
+#include "data_io.h"
+#include "auth.h"
 
 #include <iostream>
 #include <string>
@@ -7,9 +9,11 @@
 #include <fstream>
 #include <cstdio>
 #include <sstream>
+#include <stdexcept>
 
 #ifdef _WIN32
 #include <windows.h>
+#include <shellapi.h>
 // Windows 控制台默认 GBK，这里把 argv 转为 UTF-8 以正确处理中文
 static std::vector<std::string> utf8Args(int& argc) {
     wchar_t** wargv = ::CommandLineToArgvW(::GetCommandLineW(), &argc);
@@ -18,11 +22,12 @@ static std::vector<std::string> utf8Args(int& argc) {
         for (int i = 0; i < argc; ++i) {
             int len = ::WideCharToMultiByte(CP_UTF8, 0, wargv[i], -1, nullptr, 0,
                                             nullptr, nullptr);
-            std::string s(len > 0 ? len - 1 : 0, '\0');
+            std::string s(len > 0 ? len : 0, '\0');
             if (len > 1) {
                 ::WideCharToMultiByte(CP_UTF8, 0, wargv[i], -1, s.data(), len,
                                       nullptr, nullptr);
             }
+            if (!s.empty()) s.pop_back();
             args.push_back(s);
         }
         ::LocalFree(wargv);
@@ -30,6 +35,18 @@ static std::vector<std::string> utf8Args(int& argc) {
     return args;
 }
 #endif
+
+static int parseInt(const std::string& value) {
+    size_t used = 0;
+    int result = std::stoi(value, &used);
+    if (used != value.size()) throw std::invalid_argument("整数参数格式错误");
+    return result;
+}
+static size_t parseCount(const std::string& value) {
+    int result = parseInt(value);
+    if (result < 0) throw std::invalid_argument("数量不能为负数");
+    return static_cast<size_t>(result);
+}
 
 static void usage() {
     std::cout <<
@@ -86,6 +103,15 @@ static void usage() {
         "    announce club <clubId>                      某社团的公告\n"
         "    announce mine <memberId>                    我能收到的公告\n"
         "  其他:\n"
+        "    auth init <username>                       本机初始化管理员（隐藏输入密码）\n"
+        "    auth reset <username>                      停服后在本机重置密码\n"
+        "    stats                                      统计总览\n"
+        "    schedule <memberId>                        个人活动日程\n"
+        "    activity checkin <memberId> <actId>         签到并奖励 10 分\n"
+        "    activity close <actId>                     结束活动，保留历史\n"
+        "    app withdraw <appId> <memberId>             撤回本人申请\n"
+        "    export members <path.csv>                  导出成员\n"
+        "    export roster <actId> <path.csv>           导出活动名单\n"
         "    gui                                         启动局域网多人共用 Web 图形界面(浏览器打开)\n"
         "    undo / redo                                撤销 / 重做\n"
         "    save <path> / load <path>                   持久化\n"
@@ -151,7 +177,7 @@ static int runDemo() {
     int lateNight = sys.addActivity(coding, "深夜编程局", "", 5, {"Python"}, 5, 22 * 60, 23 * 60);
     int nightTalk = sys.addActivity(coding, "夜谈会", "", 5, {}, 5, 22 * 60 + 45, 23 * 60 + 15);
     std::cout << "[4] 创建「算法周赛」#" << act << "（容量=2），及两个结构化时间段活动：\n"
-              << "    「深夜编程局」#" << lateNight << "（第5天 22:30-23:00）、「夜谈会」#" << nightTalk
+              << "    「深夜编程局」#" << lateNight << "（第5天 22:00-23:00）、「夜谈会」#" << nightTalk
               << "（第5天 22:45-23:15，与前者时间重叠）\n";
     std::cout << "    Alice 报名周赛: " << sys.signup(alice, act) << "\n";
     std::cout << "    Carol 报名周赛: " << sys.signup(carol, act) << "\n";
@@ -167,7 +193,7 @@ static int runDemo() {
     for (int id : wl) { const Member* m = sys.findMember(id); std::cout << " " << (m?m->name:"?"); }
     std::cout << "\n";
 
-    std::cout << "[6] 调整周赛容量 1→3：候补中的 Dave 被提拔:\n";
+    std::cout << "[6] 调整周赛容量 2→3：候补中的 Dave 被提拔:\n";
     std::cout << "    " << (sys.setActivityCapacity(act, 3) ? "已调整" : "失败") << "\n";
 
     std::cout << "[7] 好友关系与二度人脉推荐(Alice):\n";
@@ -215,18 +241,24 @@ static int runDemo() {
     }
     std::cout << "\n";
 
-    std::cout << "[12] 撤销刚才的审批(命令模式，可 redo 重做):\n";
+    std::cout << "[12] 撤销刚才 Dave 的徒步报名(命令模式，可 redo 重做):\n";
     std::cout << "    undo -> " << (sys.undo() ? "已撤销" : "无可撤销") << "\n";
     std::cout << "    redo -> " << (sys.redo() ? "已重做" : "无可重做") << "\n";
 
     std::cout << "[13] 统计活跃度在 [10,30] 的成员数: "
               << sys.rangeActive(10, 30) << "\n";
+    std::cout << "[14] Alice 周赛签到: " << (sys.checkIn(alice, act) ? "成功，+10 分" : "失败") << "\n";
+    std::cout << "     再次签到: " << (sys.checkIn(alice, act) ? "成功" : "拒绝重复签到") << "\n";
+    auto stats = sys.statistics();
+    std::cout << "     个人日程=" << sys.memberSchedule(alice).size() << " 场，累计签到=" << stats.checkIns << "\n";
     std::cout << "\n=== 演示结束 ===\n";
     return 0;
 }
 
 int main(int argc, char** argv) {
 #ifdef _WIN32
+    SetConsoleOutputCP(CP_UTF8);
+    SetConsoleCP(CP_UTF8);
     (void)argv;
     auto args = utf8Args(argc);
 #else
@@ -236,6 +268,20 @@ int main(int argc, char** argv) {
     if (args.size() < 2) { usage(); return 0; }
     std::string cmd = args[1];
     auto a = [&](size_t i) -> std::string { return i < args.size() ? args[i] : ""; };
+    if (cmd == "auth") {
+        try {
+            if (args.size() != 4 || (a(2) != "init" && a(2) != "reset")) throw std::invalid_argument("用法：club auth init|reset <username>");
+            AuthStore auth;
+            if (a(2) == "init" && auth.initialized()) throw std::runtime_error("已有账号，不能重复初始化");
+            if (a(2) == "reset" && !auth.account(a(3))) throw std::runtime_error("账号不存在");
+            auto password = readPassword("新密码（至少 10 字节）: ");
+            if (password != readPassword("再次输入: ")) throw std::invalid_argument("两次密码不一致");
+            auto error = a(2) == "init" ? auth.initialize(a(3), password) : auth.resetPassword(a(3), password);
+            if (!error.empty()) throw std::runtime_error(error);
+            std::cout << "账号已保存；可启动 gui 登录。\n";
+            return 0;
+        } catch (const std::exception& error) { std::cerr << error.what() << '\n'; return 1; }
+    }
 
     // 解析 tag: 前缀的参数为标签
     auto collectTags = [&](size_t start) {
@@ -253,9 +299,15 @@ int main(int argc, char** argv) {
     bool noAutoSave = isDemo || cmd == "help" || cmd == "load" || cmd == "save" || cmd == "gui";
 
     // 启动时自动载入默认存档（demo 除外）
-    if (!isDemo) {
+    if (!isDemo && cmd != "help" && cmd != "load") {
         std::ifstream test(DEFAULT_SAVE);
-        if (test.good()) { test.close(); sys.load(DEFAULT_SAVE); }
+        if (test.good()) {
+            test.close();
+            if (!sys.load(DEFAULT_SAVE)) {
+                std::cerr << "存档损坏或格式不支持，已停止操作；原文件未改动。可用 load 导入有效存档。\n";
+                return 1;
+            }
+        }
     }
 
     try {
@@ -268,16 +320,16 @@ int main(int argc, char** argv) {
                 int id = sys.addMember(a(3), a(4), collectTags(5));
                 std::cout << (id >= 0 ? ("已添加 id=" + std::to_string(id)) : "失败：重名") << "\n";
             } else if (sub == "remove") {
-                std::cout << (sys.removeMember(std::stoi(a(3))) ? "已删除" : "失败：拒绝或删除") << "\n";
+                std::cout << (sys.removeMember(parseInt(a(3))) ? "已删除" : "失败：拒绝或删除") << "\n";
             } else if (sub == "score") {
-                sys.addScore(std::stoi(a(3)), std::stoi(a(4)));
+                sys.addScore(parseInt(a(3)), parseInt(a(4)));
                 std::cout << "已调整\n";
             } else if (sub == "tag") {
-                std::cout << (sys.addMemberTag(std::stoi(a(3)), a(4)) ? "已打标签" : "失败") << "\n";
+                std::cout << (sys.addMemberTag(parseInt(a(3)), a(4)) ? "已打标签" : "失败") << "\n";
             } else if (sub == "untag") {
-                std::cout << (sys.removeMemberTag(std::stoi(a(3)), a(4)) ? "已删除标签" : "失败") << "\n";
+                std::cout << (sys.removeMemberTag(parseInt(a(3)), a(4)) ? "已删除标签" : "失败") << "\n";
             } else if (sub == "tags") {
-                const Member* m = sys.findMember(std::stoi(a(3)));
+                const Member* m = sys.findMember(parseInt(a(3)));
                 if (!m) { std::cout << "未找到成员\n"; }
                 else if (m->tags.empty()) std::cout << "  (无标签)\n";
                 else {
@@ -325,18 +377,18 @@ int main(int argc, char** argv) {
                 int id = sys.createClub(a(3), a(4), a(5), a(6));
                 std::cout << (id >= 0 ? ("已创建 id=" + std::to_string(id)) : "失败：重名") << "\n";
             } else if (sub == "sub") {
-                int id = sys.createSubClub(std::stoi(a(3)), a(4), a(5), a(6), a(7));
+                int id = sys.createSubClub(parseInt(a(3)), a(4), a(5), a(6), a(7));
                 std::cout << (id >= 0 ? ("已创建子部门 id=" + std::to_string(id)) : "失败：父不存在或重名") << "\n";
             } else if (sub == "org") {
                 auto lines = sys.orgTreeLines();
                 if (lines.empty()) std::cout << "  (暂无社团)\n";
                 for (auto& l : lines) std::cout << "  " << l << "\n";
             } else if (sub == "remove") {
-                std::cout << (sys.removeClub(std::stoi(a(3))) ? "已删除" : "失败") << "\n";
+                std::cout << (sys.removeClub(parseInt(a(3))) ? "已删除" : "失败") << "\n";
             } else if (sub == "join") {
-                std::cout << (sys.joinClub(std::stoi(a(3)), std::stoi(a(4))) ? "已入社" : "失败") << "\n";
+                std::cout << (sys.joinClub(parseInt(a(3)), parseInt(a(4))) ? "已入社" : "失败") << "\n";
             } else if (sub == "leave") {
-                std::cout << (sys.leaveClub(std::stoi(a(3)), std::stoi(a(4))) ? "已退社" : "失败") << "\n";
+                std::cout << (sys.leaveClub(parseInt(a(3)), parseInt(a(4))) ? "已退社" : "失败") << "\n";
             } else if (sub == "list") {
                 for (const auto& c : sys.clubs()) {
                     if (!c.active) continue;
@@ -350,22 +402,31 @@ int main(int argc, char** argv) {
         // ---- 活动 ----
         else if (cmd == "activity") {
             std::string sub = a(2);
-            if (sub == "add") {
-                int id = sys.addActivity(std::stoi(a(3)), a(4), a(5), std::stoi(a(6)));
+            if (sub == "checkin") {
+                bool ok = sys.checkIn(parseInt(a(3)), parseInt(a(4)));
+                std::cout << (ok ? "签到成功，活跃度 +10" : "签到失败：必须正取、未签到且活动未结束") << "\n";
+                if (!ok) return 1;
+            } else if (sub == "close") {
+                bool ok = sys.closeActivity(parseInt(a(3)));
+                std::cout << (ok ? "活动已结束" : "结束失败") << "\n";
+                if (!ok) return 1;
+            } else if (sub == "add") {
+                int id = sys.addActivity(parseInt(a(3)), a(4), a(5), parseInt(a(6)));
+                if (id < 0) throw std::invalid_argument("活动参数无效或重名");
                 std::cout << "已添加 id=" << std::to_string(id) << "\n";
             } else if (sub == "addtimed") {
-                int id = sys.addActivity(std::stoi(a(3)), a(4), "", std::stoi(a(5)),
-                                         collectTags(6), std::stoi(a(6)),
-                                         std::stoi(a(7)), std::stoi(a(8)));
+                int id = sys.addActivity(parseInt(a(3)), a(4), "", parseInt(a(5)),
+                                         collectTags(6), parseInt(a(6)),
+                                         parseInt(a(7)), parseInt(a(8)));
                 std::cout << (id >= 0 ? ("已添加(带时间段) id=" + std::to_string(id)) : "失败") << "\n";
             } else if (sub == "remove") {
-                std::cout << (sys.removeActivity(std::stoi(a(3))) ? "已删除" : "失败") << "\n";
+                std::cout << (sys.removeActivity(parseInt(a(3))) ? "已删除" : "失败") << "\n";
             } else if (sub == "signup") {
-                std::cout << sys.signup(std::stoi(a(3)), std::stoi(a(4))) << "\n";
+                std::cout << sys.signup(parseInt(a(3)), parseInt(a(4))) << "\n";
             } else if (sub == "cancel") {
-                std::cout << (sys.cancelSignup(std::stoi(a(3)), std::stoi(a(4))) ? "已取消" : "失败") << "\n";
+                std::cout << (sys.cancelSignup(parseInt(a(3)), parseInt(a(4))) ? "已取消" : "失败") << "\n";
             } else if (sub == "cap") {
-                std::cout << (sys.setActivityCapacity(std::stoi(a(3)), std::stoi(a(4))) ? "已调整容量" : "失败") << "\n";
+                std::cout << (sys.setActivityCapacity(parseInt(a(3)), parseInt(a(4))) ? "已调整容量" : "失败") << "\n";
             } else if (sub == "list") {
                 for (const auto& ac : sys.activities()) {
                     if (!ac.active) continue;
@@ -375,7 +436,7 @@ int main(int argc, char** argv) {
                     std::cout << "\n";
                 }
             } else if (sub == "waitlist") {
-                auto wl = sys.activityWaitlistIds(std::stoi(a(3)));
+                auto wl = sys.activityWaitlistIds(parseInt(a(3)));
                 std::cout << "候补(" << wl.size() << "):";
                 for (int id : wl) { const Member* m = sys.findMember(id); std::cout << " " << (m?m->name:"?")<<"(#"<<id<<")"; }
                 std::cout << "\n";
@@ -384,15 +445,20 @@ int main(int argc, char** argv) {
         // ---- 申请 ----
         else if (cmd == "app") {
             std::string sub = a(2);
-            if (sub == "submit") {
-                int prio = a(5).empty() ? 0 : std::stoi(a(5));
-                int id = sys.submitApplication(std::stoi(a(3)), std::stoi(a(4)), prio);
+            if (sub == "withdraw") {
+                bool ok = sys.withdrawApplication(parseInt(a(3)), parseInt(a(4)));
+                std::cout << (ok ? "已撤回" : "撤回失败") << "\n";
+                if (!ok) return 1;
+            } else if (sub == "submit") {
+                int prio = a(5).empty() ? 0 : parseInt(a(5));
+                int id = sys.submitApplication(parseInt(a(3)), parseInt(a(4)), prio);
                 std::cout << (id >= 0 ? ("已提交 id=" + std::to_string(id)) : "失败") << "\n";
             } else if (sub == "process") {
                 int id = sys.processNextApplication();
                 std::cout << (id >= 0 ? ("处理优先级最高申请 #" + std::to_string(id)) : "无待审") << "\n";
             } else if (sub == "review") {
-                bool ok = sys.reviewApplication(std::stoi(a(3)), a(4) == "approve");
+                if (a(4) != "approve" && a(4) != "reject") throw std::invalid_argument("使用 approve 或 reject");
+                bool ok = sys.reviewApplication(parseInt(a(3)), a(4) == "approve");
                 std::cout << (ok ? "已审批" : "失败") << "\n";
             } else if (sub == "pending") {
                 std::cout << "待审数量: " << sys.pendingCount() << "\n";
@@ -401,19 +467,19 @@ int main(int argc, char** argv) {
         // ---- 好友 ----
         else if (cmd == "friend") {
             std::string sub = a(2);
-            if (sub == "add") { sys.addFriend(std::stoi(a(3)), std::stoi(a(4))); std::cout << "已添加好友\n"; }
-            else if (sub == "remove") { std::cout << (sys.removeFriend(std::stoi(a(3)), std::stoi(a(4))) ? "已删除" : "失败") << "\n"; }
+            if (sub == "add") { sys.addFriend(parseInt(a(3)), parseInt(a(4))); std::cout << "已添加好友\n"; }
+            else if (sub == "remove") { std::cout << (sys.removeFriend(parseInt(a(3)), parseInt(a(4))) ? "已删除" : "失败") << "\n"; }
             else if (sub == "recommend") {
-                auto recs = sys.recommendFriends(std::stoi(a(3)));
+                auto recs = sys.recommendFriends(parseInt(a(3)));
                 for (auto& r : recs) {
                     const Member* m = sys.findMember(r.memberId);
                     std::cout << "  推荐 " << (m?m->name:"?") << " 共同好友=" << r.mutualFriends << "\n";
                 }
                 if (recs.empty()) std::cout << "  (无推荐)\n";
             } else if (sub == "distance") {
-                std::cout << "距离: " << sys.friendDistance(std::stoi(a(3)), std::stoi(a(4))) << " 跳\n";
+                std::cout << "距离: " << sys.friendDistance(parseInt(a(3)), parseInt(a(4))) << " 跳\n";
             } else if (sub == "path") {
-                auto p = sys.friendPath(std::stoi(a(3)), std::stoi(a(4)));
+                auto p = sys.friendPath(parseInt(a(3)), parseInt(a(4)));
                 if (p.empty()) std::cout << "  不连通\n";
                 else {
                     std::cout << "  路径(" << (p.size()-1) << " 跳):";
@@ -421,7 +487,7 @@ int main(int argc, char** argv) {
                     std::cout << "\n";
                 }
             } else if (sub == "recact") {
-                auto recs = sys.recommendActivities(std::stoi(a(3)));
+                auto recs = sys.recommendActivities(parseInt(a(3)));
                 if (recs.empty()) std::cout << "  (无推荐)\n";
                 for (auto& [aid, sc] : recs) {
                     const Activity* ac = sys.findActivity(aid);
@@ -433,17 +499,17 @@ int main(int argc, char** argv) {
         else if (cmd == "rank") {
             std::string sub = a(2);
             if (sub == "leaderboard") {
-                size_t k = a(3).empty() ? 10 : std::stoul(a(3));
+                size_t k = a(3).empty() ? 10 : parseCount(a(3));
                 for (auto& [score, id] : sys.leaderboard(k)) {
                     const Member* m = sys.findMember(id);
                     std::cout << "  " << (m?m->name:"?") << " 活跃度=" << score << "\n";
                 }
             } else if (sub == "member") {
-                std::cout << "排名: " << sys.memberRank(std::stoi(a(3))) << "\n";
+                std::cout << "排名: " << sys.memberRank(parseInt(a(3))) << "\n";
             } else if (sub == "range") {
-                std::cout << "区间人数: " << sys.rangeActive(std::stoi(a(3)), std::stoi(a(4))) << "\n";
+                std::cout << "区间人数: " << sys.rangeActive(parseInt(a(3)), parseInt(a(4))) << "\n";
             } else if (sub == "clubleader") {
-                size_t k = a(3).empty() ? 10 : std::stoul(a(3));
+                size_t k = a(3).empty() ? 10 : parseCount(a(3));
                 for (auto& [total, cid] : sys.clubLeaderboard(k)) {
                     const Club* c = sys.findClub(cid);
                     std::cout << "  " << (c?c->name:"?") << " 总活跃度=" << total << "\n";
@@ -456,17 +522,17 @@ int main(int argc, char** argv) {
             if (sub == "broadcast") {
                 std::string msg;
                 for (size_t i = 5; i < args.size(); ++i) { if (i > 5) msg += " "; msg += args[i]; }
-                int id = sys.broadcast(std::stoi(a(3)), std::stoi(a(4)), msg);
+                int id = sys.broadcast(parseInt(a(3)), parseInt(a(4)), msg);
                 std::cout << (id >= 0 ? ("已广播 id=" + std::to_string(id)) : "失败") << "\n";
             } else if (sub == "club") {
-                auto list = sys.announcementsOf(std::stoi(a(3)));
+                auto list = sys.announcementsOf(parseInt(a(3)));
                 std::cout << "  公告(" << list.size() << "):\n";
                 for (auto& an : list) {
                     const Member* s = sys.findMember(an.senderId);
                     std::cout << "    #" << an.id << " 来自" << (s?s->name:"?") << ": " << an.message << "\n";
                 }
             } else if (sub == "mine") {
-                auto list = sys.announcementsForMember(std::stoi(a(3)));
+                auto list = sys.announcementsForMember(parseInt(a(3)));
                 std::cout << "  我能收到(" << list.size() << "):\n";
                 for (auto& an : list) {
                     const Club* c = sys.findClub(an.clubId);
@@ -474,14 +540,37 @@ int main(int argc, char** argv) {
                 }
             }
         }
+        else if (cmd == "stats") {
+            auto st = sys.statistics();
+            std::cout << "成员=" << st.members << " 社团=" << st.clubs << " 活动=" << st.activities
+                      << " 已结束=" << st.closedActivities << "\n正取=" << st.registrations << " 候补=" << st.waiting
+                      << " 签到=" << st.checkIns << " 待审=" << st.pending << " 总积分=" << st.totalScore << "\n";
+        } else if (cmd == "schedule") {
+            int mid = parseInt(a(2));
+            if (!sys.findMember(mid)) throw std::invalid_argument("成员不存在");
+            auto list = sys.memberSchedule(mid);
+            if (list.empty()) std::cout << "暂无参与的活动\n";
+            for (int id : list) {
+                const auto& ac = *sys.findActivity(id);
+                bool signedUp = std::find(ac.signedUp.begin(), ac.signedUp.end(), mid) != ac.signedUp.end();
+                std::cout << '#' << id << ' ' << ac.name << ' ' << (ac.closed ? "已结束" : signedUp ? "正取" : "候补")
+                          << " day=" << ac.day << ' ' << ac.startMin << '-' << ac.endMin << "\n";
+            }
+        } else if (cmd == "export") {
+            std::string csv, path;
+            if (a(2) == "members") { csv = sys.exportMembersCsv(); path = a(3); }
+            else if (a(2) == "roster") { csv = sys.exportRosterCsv(parseInt(a(3))); path = a(4); }
+            if (csv.empty() || path.empty() || !club_io::atomicWrite(path, csv)) throw std::runtime_error("导出失败");
+            std::cout << "已导出 " << path << "\n";
+        }
         // ---- 其他 ----
         else if (cmd == "undo") { std::cout << (sys.undo() ? "已撤销" : "无可撤销") << "\n"; }
         else if (cmd == "redo") { std::cout << (sys.redo() ? "已重做" : "无可重做") << "\n"; }
-        else if (cmd == "save") { std::cout << (sys.save(a(2)) ? "已保存" : "失败") << "\n"; }
+        else if (cmd == "save") { if (!sys.save(a(2))) throw std::runtime_error("保存失败"); std::cout << "已保存\n"; }
         else if (cmd == "load") {
             // 导入：载入指定存档并设为当前默认存档，后续命令自动接续
-            if (sys.load(a(2))) { sys.save(DEFAULT_SAVE); std::cout << "已载入并设为当前存档\n"; }
-            else std::cout << "失败\n";
+            if (!sys.load(a(2)) || !sys.save(DEFAULT_SAVE)) throw std::runtime_error("导入或保存失败，原存档未被覆盖");
+            std::cout << "已载入并设为当前存档\n";
         }
         else if (cmd == "gui") {
             // 启动局域网多人共用 Web 界面（长驻服务器，内部自行载入/保存 club_data.txt）
@@ -495,6 +584,6 @@ int main(int argc, char** argv) {
     }
 
     // 退出时自动保存默认存档（demo/help/load/save 除外）
-    if (!noAutoSave) { sys.save(DEFAULT_SAVE); }
+    if (!noAutoSave && !sys.save(DEFAULT_SAVE)) { std::cerr << "保存失败\n"; return 1; }
     return 0;
 }
